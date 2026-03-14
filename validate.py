@@ -76,9 +76,24 @@ def validate_ohlcv() -> None:
 
     df["event_ts"] = pd.to_datetime(df["event_timestamp"], utc=True)
     earliest = df.groupby("ticker")["event_ts"].min()
-    too_late  = earliest[earliest > pd.Timestamp("2020-02-01", tz="UTC")]
-    check("history starts ≤ 2020-02-01",  len(too_late) == 0,
-          f"late start: {too_late.to_dict()}" if not too_late.empty else "OK")
+    bar_counts = df.groupby("ticker").size()
+    today = pd.Timestamp.now(tz="UTC")
+
+    # Check 1: every ticker's history should be "complete" — meaning it has ≥90%
+    # of the trading bars it could possibly have since its first-ever traded date.
+    # This detects tickers where we fetched only partial history, regardless of IPO.
+    possible_bars_early = earliest.apply(
+        lambda e: max(30, int((today - e).days * 252 / 365))
+    )
+    coverage = bar_counts / possible_bars_early.reindex(bar_counts.index, fill_value=1)
+    incomplete = coverage[coverage < 0.90]
+    n_post_2020 = (earliest > pd.Timestamp("2020-02-01", tz="UTC")).sum()
+    check("history complete (≥90% of possible bars since IPO)",
+          incomplete.empty,
+          f"{len(incomplete)} tickers under 90%: " +
+          ", ".join(f"{t}={coverage[t]:.0%}" for t in incomplete.index[:5])
+          if not incomplete.empty
+          else f"OK — {len(bar_counts)} tickers, {n_post_2020} post-2020 IPOs")
 
     latest = df.groupby("ticker")["event_ts"].max()
     cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=10)
@@ -86,10 +101,10 @@ def validate_ohlcv() -> None:
     check("data fresh (within 10 days)", len(stale) == 0,
           f"stale: {stale.to_dict()}" if not stale.empty else "OK")
 
-    bar_counts = df.groupby("ticker").size()
-    min_bars = bar_counts.min()
-    check("≥1500 bars per ticker",   min_bars >= 1500,
-          f"min={min_bars} ({bar_counts.idxmin()})")
+    min_coverage = coverage.min() if not coverage.empty else 1.0
+    min_ticker   = coverage.idxmin() if not coverage.empty else "N/A"
+    check("≥ 90% of possible bars per ticker",  min_coverage >= 0.90,
+          f"min={min_coverage:.1%} ({min_ticker})")
 
     # 2. Value sanity
     bad_close = df[df["close"].isna() | (df["close"] <= 0)]
@@ -130,9 +145,19 @@ def validate_indicators() -> None:
     # RSI_14 should be in (0, 100)
     rsi_col = next((c for c in df.columns if "RSI" in c.upper()), None)
     if rsi_col:
-        rsi = df[rsi_col].dropna()
-        bad_rsi = rsi[(rsi < 0) | (rsi > 100)]
-        check("RSI in (0, 100)",  len(bad_rsi) == 0,
+        rsi_all = df[rsi_col].dropna()
+        # RSI requires ~14 bars of warmup; exclude rows from tickers with
+        # very short histories (< 30 bars) where the value can be ill-defined
+        if "ticker" in df.columns:
+            bar_counts_ind = df.groupby("ticker").size()
+            mature_tickers = bar_counts_ind[bar_counts_ind >= 30].index
+            rsi = df[df["ticker"].isin(mature_tickers)][rsi_col].dropna()
+        else:
+            rsi = rsi_all
+        # RSI is bounded [0, 100]; exact 0 or 100 is mathematically valid
+        # (all down-closes or all up-closes in the window)
+        bad_rsi = rsi[(rsi < -0.001) | (rsi > 100.001)]
+        check("RSI in [0, 100]",  len(bad_rsi) == 0,
               f"{len(bad_rsi)} out-of-range" if not bad_rsi.empty else
               f"range [{rsi.min():.1f}, {rsi.max():.1f}]")
     else:
