@@ -155,9 +155,14 @@ def append(table: str, new_df: pd.DataFrame) -> int:
         part_file = part_dir / "data.parquet"
 
         existing = _read_partition(part_file)
-        # Drop the synthetic partition cols from the group before storing
-        store_group = group.drop(columns=[c for c in part_cols if c in group.columns],
-                                 errors="ignore")
+        # Only drop purely synthetic date-derived partition columns (year, month).
+        # Semantic columns (indicator_code, ticker_queried, ticker) must stay
+        # in the file so read_all() can recover them without hive_partitioning.
+        SYNTHETIC_COLS = {"year", "month"}
+        store_group = group.drop(
+            columns=[c for c in part_cols if c in group.columns and c in SYNTHETIC_COLS],
+            errors="ignore",
+        )
         combined   = _merge(existing, store_group, pk_cols)
         net_new    = len(combined) - len(existing)
 

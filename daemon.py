@@ -61,24 +61,46 @@ from run_crawler import (
     _market_close_utc,
 )
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging — lazy setup called from main() only ──────────────────────────────
+# Module-level basicConfig is a no-op when imported by other scripts (e.g.
+# validate.py) that already configured the root logger.  We attach the file
+# handler explicitly in _configure_logging() instead.
 
 LOG_DIR = Path("./logs")
-LOG_DIR.mkdir(exist_ok=True)
-
-_fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-                         datefmt="%Y-%m-%d %H:%M:%S")
-
-_file_handler = logging.handlers.RotatingFileHandler(
-    LOG_DIR / "daemon.log", maxBytes=10 * 1024 * 1024, backupCount=5
-)
-_file_handler.setFormatter(_fmt)
-
-_console_handler = logging.StreamHandler(sys.stdout)
-_console_handler.setFormatter(_fmt)
-
-logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 log = logging.getLogger("daemon")
+
+
+def _configure_logging() -> None:
+    """Wire up console + rotating-file handlers.  Safe to call more than once."""
+    LOG_DIR.mkdir(exist_ok=True)
+    fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Avoid adding duplicate handlers if this function is somehow called twice
+    handler_paths = {
+        getattr(h, "baseFilename", None) for h in root.handlers
+    }
+    log_path = str((LOG_DIR / "daemon.log").resolve())
+
+    if log_path not in handler_paths:
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_DIR / "daemon.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        )
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+    # Console handler (stdout) — always add when called from main()
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    # Only add if no StreamHandler already present
+    if not any(isinstance(h, logging.StreamHandler) and
+               getattr(h, 'stream', None) is sys.stdout
+               for h in root.handlers):
+        root.addHandler(ch)
 
 ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -379,6 +401,7 @@ def run_all_once() -> None:
 
 
 def main() -> None:
+    _configure_logging()
     args = sys.argv[1:]
 
     if "--status" in args:
@@ -428,11 +451,11 @@ def main() -> None:
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    log.info("Scheduler started. Next jobs:")
+    log.info("Scheduler started. Registered jobs:")
     for job in scheduler.get_jobs():
-        log.info("  %-22s  next_run=%s", job.id, job.next_run_time)
+        log.info("  %-22s  trigger=%s", job.id, job.trigger)
 
-    scheduler.start()   # blocks here
+    scheduler.start()   # blocks here — next_run_time is set after this returns
 
 
 if __name__ == "__main__":
