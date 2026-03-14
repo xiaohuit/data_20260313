@@ -431,7 +431,7 @@ async def fetch_insider_trades(ticker: str) -> pd.DataFrame:
         table = soup.find("table", {"class": "tinytable"})
         if not table:
             return pd.DataFrame()
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        headers = [th.get_text(strip=True).replace('\xa0', ' ').strip().lower() for th in table.find_all("th")]
         rows = []
         for tr in table.find_all("tr")[1:]:
             cells = tr.find_all("td")
