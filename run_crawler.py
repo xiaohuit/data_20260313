@@ -19,10 +19,12 @@ import logging
 import sys
 import warnings
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 
 import httpx
 import pandas as pd
+import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 
@@ -40,17 +42,25 @@ DATA_DIR = Path("./data")
 START = datetime(2020, 1, 1, tzinfo=UTC)
 END   = datetime.now(UTC)
 
-# Representative universe — 20 tickers covering different sectors
+# Minimal bootstrap list — used ONLY when no universe has ever been stored yet.
+# The real universe is fetched live from Wikipedia (S&P 500 + NASDAQ 100) and
+# stored in data/universe/; subsequent runs read from there.
 TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",   # Tech
-    "META", "TSLA", "NFLX",                       # Growth
-    "JPM",  "BAC",                                 # Financials
-    "JNJ",  "UNH",                                 # Healthcare
-    "XOM",  "CVX",                                 # Energy
-    "WMT",  "HD",                                  # Consumer
-    "SPY",  "QQQ",                                 # Index ETFs
-    "GLD",  "TLT",                                 # Macro proxies
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM",
+    "JNJ",  "XOM",  "WMT",   "BAC",  "UNH",  "CVX",  "HD",
+    "PG",   "MA",   "V",     "NFLX", "AVGO",
 ]
+
+# Browser-like headers — prevents Wikipedia 403 on automated requests
+_WIKI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 FRED_SERIES = {
     "FED_FUNDS_RATE": "FEDFUNDS",
@@ -64,56 +74,122 @@ FRED_SERIES = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Universe from Wikipedia
+# 1. Universe from Wikipedia (live, dynamic — reflects actual index changes)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_wiki_table(url: str, table_id: str, index_name: str) -> pd.DataFrame:
+    """
+    Synchronous: fetch a Wikipedia constituents table using browser-like
+    headers to avoid 403. Raises on failure so the caller can handle fallback.
+    """
+    resp = requests.get(url, headers=_WIKI_HEADERS, timeout=30)
+    resp.raise_for_status()
+    tables = pd.read_html(StringIO(resp.text), attrs={"id": table_id})
+    if not tables:
+        raise ValueError(f"No table id='{table_id}' on {url}")
+    df_raw = tables[0]
+    df_raw.columns = [c.strip() for c in df_raw.columns]
+
+    ticker_col  = next((c for c in df_raw.columns
+                        if "symbol" in c.lower() or "ticker" in c.lower()),
+                       df_raw.columns[0])
+    company_col = next((c for c in df_raw.columns
+                        if "security" in c.lower() or "company" in c.lower()),
+                       df_raw.columns[1] if len(df_raw.columns) > 1 else df_raw.columns[0])
+    sector_col  = next((c for c in df_raw.columns if "sector" in c.lower()), None)
+    sub_col     = next((c for c in df_raw.columns
+                        if "sub" in c.lower() and "industry" in c.lower()), None)
+
+    rows = []
+    for _, r in df_raw.iterrows():
+        ticker = str(r[ticker_col]).replace(".", "-").strip()
+        if not ticker or ticker.lower() == "nan":
+            continue
+        rows.append({
+            "ticker":              ticker,
+            "company":             str(r[company_col]),
+            "sector":              str(r[sector_col]) if sector_col else "",
+            "sub_industry":        str(r[sub_col]) if sub_col else "",
+            "index":               index_name,
+            "added_date":          pd.Timestamp.today().date().isoformat(),
+            "knowledge_timestamp": datetime.now(UTC).isoformat(),
+        })
+    return pd.DataFrame(rows)
+
+
 async def fetch_sp500_universe() -> pd.DataFrame:
-    """
-    Uses pandas.read_html which sends a more browser-like request,
-    bypassing Wikipedia's bot-rate-limit for the table endpoint.
-    """
+    """Fetch current S&P 500 constituents from Wikipedia."""
     log.info("📋  Fetching S&P 500 universe from Wikipedia …")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    loop = asyncio.get_running_loop()
     try:
-        import asyncio
-        loop = asyncio.get_running_loop()
-        # pandas read_html in thread pool (it's synchronous)
-        tables = await loop.run_in_executor(
-            None,
-            lambda: pd.read_html(url, attrs={"id": "constituents"}),
+        df = await loop.run_in_executor(
+            None, lambda: _parse_wiki_table(url, "constituents", "S&P 500")
         )
-        if not tables:
-            raise ValueError("No table found")
-        df_raw = tables[0]
-        # Normalise columns
-        df_raw.columns = [c.strip() for c in df_raw.columns]
-        ticker_col  = next((c for c in df_raw.columns if "symbol" in c.lower() or "ticker" in c.lower()), df_raw.columns[0])
-        company_col = next((c for c in df_raw.columns if "security" in c.lower() or "company" in c.lower()), df_raw.columns[1])
-        sector_col  = next((c for c in df_raw.columns if "sector" in c.lower()), None)
-        sub_col     = next((c for c in df_raw.columns if "sub" in c.lower() and "industry" in c.lower()), None)
-
-        rows = []
-        for _, r in df_raw.iterrows():
-            rows.append({
-                "ticker":           str(r[ticker_col]).replace(".", "-"),
-                "company":          str(r[company_col]),
-                "sector":           str(r[sector_col]) if sector_col else "",
-                "sub_industry":     str(r[sub_col]) if sub_col else "",
-                "added_date":       pd.Timestamp.today().date().isoformat(),
-                "knowledge_timestamp": datetime.now(UTC).isoformat(),
-            })
-        df = pd.DataFrame(rows)
         log.info("    → %d S&P 500 members", len(df))
         return df
     except Exception as exc:
-        log.warning("    Wikipedia S&P 500 fetch failed: %s — using hardcoded list", exc)
-        # Fallback: return the tickers we know
-        return pd.DataFrame([
-            {"ticker": t, "company": t, "sector": "", "sub_industry": "",
-             "added_date": pd.Timestamp.today().date().isoformat(),
-             "knowledge_timestamp": datetime.now(UTC).isoformat()}
-            for t in TICKERS
-        ])
+        log.warning("    S&P 500 Wikipedia fetch failed: %s", exc)
+        return pd.DataFrame()
+
+
+async def fetch_ndx100_universe() -> pd.DataFrame:
+    """Fetch current NASDAQ 100 constituents from Wikipedia."""
+    log.info("📋  Fetching NASDAQ 100 universe from Wikipedia …")
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+    loop = asyncio.get_running_loop()
+    try:
+        df = await loop.run_in_executor(
+            None, lambda: _parse_wiki_table(url, "constituents", "NASDAQ 100")
+        )
+        log.info("    → %d NASDAQ 100 members", len(df))
+        return df
+    except Exception as exc:
+        log.warning("    NASDAQ 100 Wikipedia fetch failed: %s", exc)
+        return pd.DataFrame()
+
+
+async def fetch_full_universe() -> pd.DataFrame:
+    """
+    Fetch S&P 500 + NASDAQ 100 from Wikipedia, merge and deduplicate.
+
+    Fallback chain:
+      1. Live Wikipedia fetch (both indices, ~600 tickers before dedup)
+      2. Last stored universe from data/universe/ (if fetch fails)
+      3. Minimal TICKERS list (bootstrap only — should never reach this)
+    """
+    import storage as _storage  # imported here to avoid circular imports
+
+    sp500, ndx100 = await asyncio.gather(
+        fetch_sp500_universe(),
+        fetch_ndx100_universe(),
+    )
+
+    live_frames = [f for f in [sp500, ndx100] if not f.empty]
+    if live_frames:
+        combined = pd.concat(live_frames, ignore_index=True)
+        # Deduplicate by ticker — keep S&P 500 entry when both have a row
+        combined = combined.drop_duplicates(subset=["ticker"], keep="first")
+        log.info("    → %d unique tickers (S&P 500 + NASDAQ 100)", len(combined))
+        return combined
+
+    # Both fetches failed — use last stored universe so jobs aren't blocked
+    stored = _storage.read_all("universe")
+    if not stored.empty:
+        log.warning(
+            "    Wikipedia unreachable — using %d previously stored tickers",
+            stored["ticker"].nunique(),
+        )
+        return stored
+
+    # Absolute last resort: bootstrap list
+    log.error("    No universe available from any source — using bootstrap list")
+    return pd.DataFrame([
+        {"ticker": t, "company": t, "sector": "", "sub_industry": "",
+         "index": "bootstrap", "added_date": pd.Timestamp.today().date().isoformat(),
+         "knowledge_timestamp": datetime.now(UTC).isoformat()}
+        for t in TICKERS
+    ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -571,16 +647,17 @@ def save(df: pd.DataFrame, subdir: str, filename: str) -> None:
 async def main() -> None:
     log.info("=" * 65)
     log.info("  FINANCIAL DATA PIPELINE — STANDALONE CRAWLER RUN")
-    log.info("  Universe: %d tickers  |  Start: %s  |  End: %s",
-             len(TICKERS), START.date(), END.date())
+    log.info("  Start: %s  |  End: %s", START.date(), END.date())
     log.info("=" * 65)
 
-    # 1. Universe
-    universe_df = await fetch_sp500_universe()
-    save(universe_df, "universe", "sp500_current.csv")
+    # 1. Universe (live from Wikipedia: S&P 500 + NASDAQ 100)
+    universe_df = await fetch_full_universe()
+    save(universe_df, "universe", "sp500_ndx100_current.csv")
+    live_tickers = universe_df["ticker"].tolist() if not universe_df.empty else TICKERS
+    log.info("  Universe: %d tickers", len(live_tickers))
 
     # 2. OHLCV
-    ohlcv = await fetch_all_ohlcv(TICKERS)
+    ohlcv = await fetch_all_ohlcv(live_tickers)
     save(ohlcv, "ohlcv", "ohlcv_daily.csv")
 
     if ohlcv.empty:
@@ -595,12 +672,12 @@ async def main() -> None:
     macro = await fetch_all_macro()
     save(macro, "macro", "macro_series.csv")
 
-    # 5. Insider trades
-    insider = await fetch_all_insider(TICKERS[:5])
+    # 5. Insider trades (limit to 20 tickers to be courteous to OpenInsider)
+    insider = await fetch_all_insider(live_tickers[:20])
     save(insider, "insider", "insider_trades.csv")
 
     # 6. Earnings
-    earnings = await fetch_all_earnings(TICKERS)
+    earnings = await fetch_all_earnings(live_tickers)
     save(earnings, "earnings", "earnings_history.csv")
 
     # 7. PiT correctness

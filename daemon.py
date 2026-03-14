@@ -50,14 +50,14 @@ from apscheduler.executors.pool import ThreadPoolExecutor
 import storage
 import state as state_mod
 from run_crawler import (
-    TICKERS,
+    TICKERS,           # minimal bootstrap list (fallback only)
     FRED_SERIES,
     fetch_ohlcv_one,
     compute_indicators_one,
     fetch_earnings_one,
     fetch_fred_series,
     fetch_insider_trades,
-    fetch_sp500_universe,
+    fetch_full_universe,
     _market_close_utc,
 )
 
@@ -125,6 +125,23 @@ def _log_job(name: str, rows: int, status: str = "OK") -> None:
     log.info("%-22s  %-4s  +%d rows written", name, status, rows)
 
 
+def _get_tickers() -> list[str]:
+    """
+    Return the current ticker universe from the stored universe table.
+    This reflects the live S&P 500 + NASDAQ 100 composition as of the last
+    universe job run (every Monday 08:00).
+    Falls back to the minimal bootstrap TICKERS list on first ever startup
+    before any universe fetch has succeeded.
+    """
+    df = storage.read_all("universe")
+    if not df.empty and "ticker" in df.columns:
+        tickers = df["ticker"].dropna().unique().tolist()
+        log.debug("_get_tickers: %d tickers from stored universe", len(tickers))
+        return tickers
+    log.warning("_get_tickers: universe table empty — using bootstrap list (%d tickers)", len(TICKERS))
+    return list(TICKERS)
+
+
 # ── Job: OHLCV daily bars ─────────────────────────────────────────────────────
 
 def job_ohlcv() -> None:
@@ -132,7 +149,9 @@ def job_ohlcv() -> None:
     total = 0
     now = datetime.now(UTC)
 
-    for ticker in TICKERS:
+    tickers = _get_tickers()
+    log.info("  Processing %d tickers", len(tickers))
+    for ticker in tickers:
         since = _since("ohlcv", ticker)
         try:
             df = fetch_ohlcv_one(ticker)   # always fetches full history, sliced below
@@ -158,11 +177,12 @@ def job_indicators() -> None:
     total = 0
     now = datetime.now(UTC)
 
-    for ticker in TICKERS:
+    tickers = _get_tickers()
+    log.info("  Processing %d tickers", len(tickers))
+    ohlcv_all = storage.read_all("ohlcv")   # read once, share across all tickers
+    for ticker in tickers:
         since = _since("indicators", ticker)
         try:
-            # Read OHLCV for this ticker from storage (last 300 days for warmup)
-            ohlcv_all = storage.read_all("ohlcv")
             if ohlcv_all.empty:
                 break
             sub = ohlcv_all[ohlcv_all["ticker"] == ticker].copy()
@@ -225,7 +245,17 @@ def job_insider() -> None:
 
     async def _fetch_all():
         frames = []
-        for ticker in TICKERS[:10]:   # OpenInsider: be courteous
+        # OpenInsider: limit to 50 tickers per run, rotate through the universe
+        # daily so the full list is covered over the week
+        import datetime as _dt
+        day_of_year = _dt.date.today().timetuple().tm_yday
+        all_tickers = _get_tickers()
+        batch_size = 50
+        start_idx = (day_of_year * batch_size) % max(len(all_tickers), 1)
+        batch = (all_tickers + all_tickers)[start_idx:start_idx + batch_size]
+        log.info("  Insider batch: tickers %d-%d of %d",
+                 start_idx, start_idx + len(batch), len(all_tickers))
+        for ticker in batch:   # OpenInsider: be courteous
             df = await fetch_insider_trades(ticker)
             frames.append((ticker, df))
             await asyncio.sleep(2.0)
@@ -252,7 +282,7 @@ def job_earnings() -> None:
     now = datetime.now(UTC)
     loop = asyncio.new_event_loop()
 
-    for ticker in TICKERS:
+    for ticker in _get_tickers():
         try:
             df = fetch_earnings_one(ticker)
             if df.empty:
@@ -282,8 +312,13 @@ def job_earnings() -> None:
 def job_universe() -> None:
     log.info("── JOB: universe ─────────────────────────────────────")
     try:
-        df = _run_async(fetch_sp500_universe())
+        df = _run_async(fetch_full_universe())
+        if df.empty:
+            log.warning("  universe: no data returned")
+            return
         n = storage.append("universe", df)
+        tickers = df["ticker"].nunique()
+        log.info("  universe: %d unique tickers stored", tickers)
         STATE.set_last_fetched("universe")
         _log_job("universe", n)
     except Exception as exc:
