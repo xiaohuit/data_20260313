@@ -42,21 +42,23 @@ DATA_ROOT = Path("./data")
 # ── Primary key definitions (used for deduplication) ─────────────────────────
 
 PK = {
-    "ohlcv":      ["event_timestamp", "ticker", "frequency"],
-    "indicators": ["event_timestamp", "ticker"],
-    "macro":      ["event_timestamp", "indicator_code", "revision_number"],
-    "insider":    ["ticker_queried", "trade date", "insider name", "trade type", "qty"],
-    "earnings":   ["ticker", "period_end", "form"],
-    "universe":   ["ticker"],
+    "ohlcv":       ["event_timestamp", "ticker", "frequency"],
+    "indicators":  ["event_timestamp", "ticker"],
+    "macro":       ["event_timestamp", "indicator_code", "revision_number"],
+    "insider":     ["ticker_queried", "trade date", "insider name", "trade type", "qty"],
+    "earnings":    ["ticker", "period_end", "form"],
+    "financials":  ["ticker", "period_end", "form"],
+    "universe":    ["ticker"],
 }
 
 # Partition columns per table (determines directory nesting)
 PARTITION_COLS = {
-    "ohlcv":      ["year", "month"],
-    "indicators": ["year", "month"],
-    "macro":      ["indicator_code", "year"],
-    "insider":    ["ticker_queried", "year"],
-    "earnings":   ["ticker", "year"],
+    "ohlcv":       ["year", "month"],
+    "indicators":  ["year", "month"],
+    "macro":       ["indicator_code", "year"],
+    "insider":     ["ticker_queried", "year"],
+    "earnings":    ["ticker", "year"],
+    "financials":  ["ticker", "year"],
 }
 
 
@@ -81,7 +83,7 @@ def _add_partition_cols(df: pd.DataFrame, table: str) -> pd.DataFrame:
         else:
             ts = pd.Series([pd.Timestamp.now(tz="UTC")] * len(df), index=df.index)
         df["year"] = ts.dt.year.fillna(9999).astype(int).astype(str)
-    elif table == "earnings":
+    elif table in ("earnings", "financials"):
         if "period_end" in df.columns:
             ts = pd.to_datetime(df["period_end"], errors="coerce", utc=True)
         elif "event_timestamp" in df.columns:
@@ -222,7 +224,7 @@ def read_all(table: str) -> pd.DataFrame:
 def row_counts() -> dict[str, int]:
     """Quick audit: how many rows are stored per table."""
     counts = {}
-    for table in ("ohlcv", "indicators", "macro", "insider", "earnings", "universe"):
+    for table in ("ohlcv", "indicators", "macro", "insider", "earnings", "financials", "universe"):
         root = DATA_ROOT / table
         if not root.exists():
             counts[table] = 0

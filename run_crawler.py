@@ -632,7 +632,231 @@ async def fetch_all_earnings(tickers: list[str]) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. PiT correctness check
+# 7. Fundamental financials (SEC EDGAR XBRL — income stmt, balance sheet, CF)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Priority-ordered XBRL tags per metric (first tag with data wins)
+_GAAP_TAGS: dict[str, list[str]] = {
+    # ── Income statement ──────────────────────────────────────────────────────
+    "revenue": [
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+    ],
+    "gross_profit":      ["GrossProfit"],
+    "operating_income":  ["OperatingIncomeLoss"],
+    "net_income":        ["NetIncomeLoss"],
+    "interest_expense":  ["InterestExpense", "InterestAndDebtExpense"],
+    "depreciation_amortization": [
+        "DepreciationDepletionAndAmortization",
+        "DepreciationAndAmortization",
+        "Depreciation",
+    ],
+    # ── Balance sheet (instant — point-in-time) ───────────────────────────────
+    "total_assets":  ["Assets"],
+    "total_equity":  [
+        "StockholdersEquity",
+        "StockholdersEquityAttributableToParent",
+        "Equity",
+    ],
+    "lt_debt":  ["LongTermDebt", "LongTermDebtNoncurrent"],
+    "cash":     [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsAndShortTermInvestments",
+    ],
+    # ── Cash flow statement ───────────────────────────────────────────────────
+    "operating_cf": ["NetCashProvidedByUsedInOperatingActivities"],
+    "capex":        ["PaymentsToAcquirePropertyPlantAndEquipment"],
+    # ── Share count ───────────────────────────────────────────────────────────
+    "shares_outstanding": [
+        "CommonStockSharesOutstanding",
+        "CommonStockSharesIssuedAndOutstanding",
+    ],
+}
+
+
+def _extract_xbrl_metric(
+    us_gaap: dict, tags: list[str]
+) -> dict[tuple, tuple]:
+    """
+    Merge data from ALL candidate tags into {(period_end, form): (value, filed_date)}.
+    Companies often switch XBRL tags over time (e.g. AAPL used SalesRevenueNet
+    through 2017, then RevenueFromContractWithCustomerExcludingAssessedTax from
+    2018 onward after ASC 606 adoption). Merging all tags gives full history.
+
+    Conflict resolution when multiple tags report the same (period_end, form):
+      - Earlier tag in the priority list wins (it is preferred semantically).
+      - Within the same tag, the most recently filed revision wins.
+    """
+    merged: dict[tuple, tuple] = {}
+    for priority, tag in enumerate(tags):
+        data = us_gaap.get(tag, {})
+        if not data:
+            continue
+        for unit_vals in data.get("units", {}).values():
+            for e in unit_vals:
+                form = e.get("form", "")
+                if form not in ("10-K", "10-Q"):
+                    continue
+                period_end = e.get("end")
+                filed      = e.get("filed", "")
+                val        = e.get("val")
+                if not period_end or val is None:
+                    continue
+                key = (period_end, form)
+                existing = merged.get(key)
+                if existing is None:
+                    merged[key] = (val, filed, priority)
+                else:
+                    ex_priority, ex_filed = existing[2], existing[1]
+                    # Lower priority index = preferred tag; within same tag keep latest filed
+                    if priority < ex_priority or (priority == ex_priority and filed > ex_filed):
+                        merged[key] = (val, filed, priority)
+    # Strip priority from result
+    return {k: (v[0], v[1]) for k, v in merged.items()}
+
+
+def fetch_financials_edgar(ticker: str) -> pd.DataFrame:
+    """
+    Fetch full fundamental financials from SEC EDGAR XBRL in one API call.
+    Returns one row per (ticker, period_end, form) with:
+      - Income statement: revenue, gross_profit, operating_income, net_income,
+                          interest_expense, depreciation_amortization
+      - Balance sheet:    total_assets, total_equity, lt_debt, cash
+      - Cash flow:        operating_cf, capex
+      - Share count:      shares_outstanding
+      - Derived:          fcf, gross_margin, net_margin, roe, debt_to_equity,
+                          fcf_margin
+    knowledge_timestamp = SEC filing date (proper PiT — no look-ahead).
+    """
+    cik_map = _load_edgar_cik_map()
+    cik = cik_map.get(ticker.upper())
+    if not cik:
+        return pd.DataFrame()
+    try:
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=30)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        us_gaap = resp.json().get("facts", {}).get("us-gaap", {})
+
+        # Extract all metrics into {(period_end, form): (value, filed)} dicts
+        metric_data: dict[str, dict[tuple, tuple]] = {
+            metric: _extract_xbrl_metric(us_gaap, tags)
+            for metric, tags in _GAAP_TAGS.items()
+        }
+
+        # Union of all (period_end, form) keys across every metric
+        all_keys: set[tuple] = set()
+        for d in metric_data.values():
+            all_keys.update(d.keys())
+        if not all_keys:
+            return pd.DataFrame()
+
+        rows = []
+        for (period_end, form) in all_keys:
+            # Use the latest filing date seen across any metric for this period
+            filed_dates = [
+                metric_data[m][(period_end, form)][1]
+                for m in metric_data
+                if (period_end, form) in metric_data[m]
+            ]
+            filed = max(filed_dates) if filed_dates else period_end
+
+            row: dict = {
+                "ticker":               ticker,
+                "period_end":           period_end,
+                "form":                 form,
+                "event_timestamp":      period_end,
+                "knowledge_timestamp":  filed,
+                "source":               "SEC_EDGAR",
+            }
+            for metric in _GAAP_TAGS:
+                entry = metric_data[metric].get((period_end, form))
+                row[metric] = entry[0] if entry else None
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        # Restrict to study window
+        df["_period_ts"] = pd.to_datetime(df["period_end"], errors="coerce")
+        df = df[df["_period_ts"] >= pd.Timestamp(START_EQUITY.date())].copy()
+
+        # ── Derived metrics ───────────────────────────────────────────────────
+        def _div(a, b):
+            try:
+                return float(a) / float(b) if b and float(b) != 0 else None
+            except Exception:
+                return None
+
+        df["fcf"]           = df.apply(
+            lambda r: (float(r["operating_cf"]) - float(r["capex"]))
+            if r["operating_cf"] is not None and r["capex"] is not None else None, axis=1)
+        df["gross_margin"]  = df.apply(lambda r: _div(r["gross_profit"],  r["revenue"]),       axis=1)
+        df["net_margin"]    = df.apply(lambda r: _div(r["net_income"],     r["revenue"]),       axis=1)
+        df["roe"]           = df.apply(lambda r: _div(r["net_income"],     r["total_equity"]),  axis=1)
+        df["debt_to_equity"]= df.apply(lambda r: _div(r["lt_debt"],        r["total_equity"]),  axis=1)
+        df["fcf_margin"]    = df.apply(lambda r: _div(r["fcf"],            r["revenue"]),       axis=1)
+
+        # Null-out gross_margin values that are clearly XBRL tag mismatches
+        # (gross_profit from one segment vs. total revenue from another).
+        # Gross margin cannot exceed 100% — if it does, revenue and gross_profit
+        # are from different XBRL scopes and the ratio is meaningless.
+        df.loc[
+            df["gross_margin"].notna() &
+            ((df["gross_margin"] >= 1.0) | (df["gross_margin"] < -1.0)),
+            "gross_margin"
+        ] = None
+        df.loc[
+            df["fcf_margin"].notna() &
+            ((df["fcf_margin"] > 5.0) | (df["fcf_margin"] < -5.0)),
+            "fcf_margin"
+        ] = None
+        df.loc[
+            df["net_margin"].notna() &
+            ((df["net_margin"] > 5.0) | (df["net_margin"] < -5.0)),
+            "net_margin"
+        ] = None
+
+        # PiT guard: knowledge_timestamp must be >= period_end
+        # EDGAR occasionally has quirky filed dates on restated/transition filings
+        df["_kt"] = pd.to_datetime(df["knowledge_timestamp"], errors="coerce")
+        df["_pe"] = pd.to_datetime(df["period_end"],          errors="coerce")
+        mask = df["_kt"].notna() & df["_pe"].notna() & (df["_kt"] < df["_pe"])
+        df.loc[mask, "knowledge_timestamp"] = df.loc[mask, "period_end"]
+        df = df.drop(columns=["_kt", "_pe"])
+
+        # Dedup: same (ticker, period_end, form) — keep latest filed revision
+        df = df.sort_values("knowledge_timestamp").drop_duplicates(
+            subset=["ticker", "period_end", "form"], keep="last"
+        )
+        return df.drop(columns=["_period_ts"]).reset_index(drop=True)
+
+    except Exception as exc:
+        log.debug("EDGAR financials %s: %s", ticker, exc)
+        return pd.DataFrame()
+
+
+async def fetch_all_financials(tickers: list[str]) -> pd.DataFrame:
+    log.info("📊  Fetching fundamental financials (SEC EDGAR XBRL) …")
+    loop = asyncio.get_running_loop()
+    frames = []
+    for i, ticker in enumerate(tickers, 1):
+        df = await loop.run_in_executor(None, fetch_financials_edgar, ticker)
+        if not df.empty:
+            frames.append(df)
+        await asyncio.sleep(0.15)   # SEC fair-use: max 10 req/s
+        if i % 50 == 0:
+            log.info("    financials %d/%d …", i, len(tickers))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d financial records across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. PiT correctness check
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_pit_check(ohlcv: pd.DataFrame) -> bool:
@@ -837,7 +1061,11 @@ async def main() -> None:
     earnings = await fetch_all_earnings(live_tickers)
     save(earnings, "earnings", "earnings_history.csv")
 
-    # 7. PiT correctness
+    # 7. Fundamental financials (income stmt, balance sheet, cash flow)
+    financials = await fetch_all_financials(live_tickers)
+    save(financials, "financials", "fundamentals.csv")
+
+    # 8. PiT correctness
     log.info("")
     pit_ok = run_pit_check(ohlcv)
 
@@ -863,6 +1091,8 @@ async def main() -> None:
              len(macro), macro["indicator_code"].nunique() if not macro.empty else 0)
     log.info("  Insider trade rows:  %d", len(insider))
     log.info("  Earnings rows:       %d", len(earnings))
+    log.info("  Financials rows:     %d  (%d tickers)",
+             len(financials), financials["ticker"].nunique() if not financials.empty else 0)
     log.info("  PiT check:           %s", "✅ PASS" if pit_ok else "❌ FAIL")
     log.info("")
     log.info("  PiT snapshot (2023-06-30):")

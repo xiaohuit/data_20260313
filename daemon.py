@@ -55,6 +55,7 @@ from run_crawler import (
     fetch_ohlcv_one,
     compute_indicators_one,
     fetch_earnings_one,
+    fetch_financials_edgar,
     fetch_fred_series,
     fetch_insider_trades,
     fetch_full_universe,
@@ -298,6 +299,31 @@ def job_earnings() -> None:
     _log_job("earnings", total)
 
 
+# ── Job: Fundamental financials ───────────────────────────────────────────────
+
+def job_financials() -> None:
+    log.info("── JOB: financials ───────────────────────────────────")
+    total = 0
+    now = datetime.now(UTC)
+
+    tickers = _get_tickers()
+    log.info("  Processing %d tickers (SEC EDGAR XBRL)", len(tickers))
+    for ticker in tickers:
+        try:
+            df = fetch_financials_edgar(ticker)
+            if df.empty:
+                continue
+            n = storage.append("financials", df)
+            total += n
+            if n:
+                log.debug("  financials %-6s +%d", ticker, n)
+            STATE.set_last_fetched("financials", ticker, now)
+        except Exception as exc:
+            log.error("  financials %s FAILED: %s", ticker, exc)
+
+    _log_job("financials", total)
+
+
 # ── Job: Universe refresh ─────────────────────────────────────────────────────
 
 def job_universe() -> None:
@@ -403,6 +429,11 @@ def build_scheduler() -> BlockingScheduler:
                       hour=7, minute=0,  id="macro_fred",
                       max_instances=1, misfire_grace_time=3600)
 
+    # ── Fundamentals: every Saturday morning (weekly, low urgency) ───────────
+    scheduler.add_job(job_financials, "cron", day_of_week="sat",
+                      hour=6, minute=0,  id="financials",
+                      max_instances=1, misfire_grace_time=7200)
+
     # ── Universe: every Monday morning ───────────────────────────────────────
     scheduler.add_job(job_universe,   "cron", day_of_week="mon",
                       hour=8, minute=0,  id="universe",
@@ -418,7 +449,7 @@ def run_all_once() -> None:
     """Run every job immediately in sequence (for --once mode)."""
     log.info("Running all jobs once …")
     for fn in (job_universe, job_ohlcv, job_indicators,
-               job_macro, job_earnings, job_insider):
+               job_macro, job_earnings, job_financials, job_insider):
         try:
             fn()
         except Exception as exc:
@@ -457,7 +488,7 @@ def main() -> None:
     # Run all jobs immediately on startup to catch up on any missed data
     log.info("Initial catch-up run …")
     for fn in (job_universe, job_ohlcv, job_indicators,
-               job_macro, job_earnings, job_insider):
+               job_macro, job_earnings, job_financials, job_insider):
         try:
             fn()
         except Exception as exc:

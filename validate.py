@@ -38,7 +38,7 @@ log = logging.getLogger("validate")
 import storage, state as state_mod
 from daemon import (
     job_ohlcv, job_indicators, job_macro,
-    job_earnings, job_insider, TICKERS,
+    job_earnings, job_financials, job_insider, TICKERS,
 )
 
 UTC = timezone.utc
@@ -316,7 +316,74 @@ def validate_alternative() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8  Partition integrity
+# 8  Fundamental financials
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_financials() -> None:
+    log.info("\n── 8  Fundamental Financials ────────────────────────────")
+    df = storage.read_all("financials")
+
+    if df.empty:
+        check("financials loaded", False, "empty"); return
+    check("financials loaded", True, f"{len(df):,} rows")
+
+    tickers_with_data = df["ticker"].nunique()
+    check("financials covers ≥ 400 tickers", tickers_with_data >= 400,
+          f"{tickers_with_data} tickers")
+
+    # Forms present
+    forms = df["form"].value_counts().to_dict() if "form" in df.columns else {}
+    check("10-K and 10-Q both present",
+          "10-K" in forms and "10-Q" in forms,
+          str(forms))
+
+    # Date range: should go back to at least 2012
+    df["period_ts"] = pd.to_datetime(df["period_end"], errors="coerce", utc=True)
+    earliest = df["period_ts"].min()
+    check("financials history starts ≤ 2013",
+          earliest <= pd.Timestamp("2013-01-01", tz="UTC"),
+          f"earliest={earliest.date() if pd.notna(earliest) else 'N/A'}")
+
+    # Key columns present
+    required = ["revenue", "net_income", "total_equity", "operating_cf", "capex", "fcf"]
+    for col in required:
+        check(f"column '{col}' present", col in df.columns, col)
+
+    # Revenue sanity: should be positive for most rows (exclude pre-revenue cos.)
+    if "revenue" in df.columns:
+        rev = df["revenue"].dropna()
+        pct_positive = (rev > 0).mean()
+        check("revenue > 0 for ≥ 80% of rows", pct_positive >= 0.80,
+              f"{pct_positive:.1%} positive")
+
+    # Gross margin sanity: between -50% and 100%
+    if "gross_margin" in df.columns:
+        gm = df["gross_margin"].dropna()
+        bad_gm = gm[(gm < -0.5) | (gm > 1.0)]
+        check("gross_margin in [-50%, 100%]", len(bad_gm) == 0,
+              f"{len(bad_gm)} out-of-range" if not bad_gm.empty else
+              f"range [{gm.min():.1%}, {gm.max():.1%}]")
+
+    # PiT: knowledge_timestamp >= period_end
+    df["kt"] = pd.to_datetime(df["knowledge_timestamp"], errors="coerce", utc=True)
+    lookahead = df[df["kt"] < df["period_ts"] - pd.Timedelta(days=1)]
+    check("financials PiT: no look-ahead", len(lookahead) == 0,
+          f"{len(lookahead)} violations" if not lookahead.empty else "OK")
+
+    # Spot check: AAPL FY2023 (10-K ending ~Sep 2023) revenue should be ~$383B
+    aapl_10k = df[(df["ticker"] == "AAPL") & (df["form"] == "10-K")].copy()
+    if not aapl_10k.empty and "revenue" in df.columns:
+        aapl_10k = aapl_10k.sort_values("period_end")
+        fy2023 = aapl_10k[aapl_10k["period_end"].str.startswith("2023")]
+        if not fy2023.empty:
+            rev_val = float(fy2023["revenue"].iloc[-1])
+            check("AAPL FY2023 revenue ≈ $383B",
+                  300e9 < rev_val < 500e9,
+                  f"actual=${rev_val/1e9:.0f}B")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9  Partition integrity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_partitions() -> None:
@@ -499,6 +566,7 @@ def main() -> int:
     validate_indicators()
     validate_macro()
     validate_alternative()
+    validate_financials()
     validate_partitions()
     validate_incremental_append()
     validate_idempotency()
