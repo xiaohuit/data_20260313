@@ -72,6 +72,14 @@ _WIKI_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# SEC EDGAR requires: "Company Name contact@email.com" format
+# See https://www.sec.gov/os/accessing-edgar-data
+_EDGAR_HEADERS = {
+    "User-Agent": "FinancialDataPipeline research@financialpipeline.example.com",
+    "Accept": "application/json",
+    "Host": "data.sec.gov",
+}
+
 FRED_SERIES = {
     "FED_FUNDS_RATE": "FEDFUNDS",
     "CPI_YOY":        "CPIAUCSL",
@@ -452,36 +460,174 @@ async def fetch_all_insider(tickers: list[str]) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Earnings history
+# 6. Earnings history — SEC EDGAR XBRL (historical) + yfinance (estimates)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_earnings_one(ticker: str) -> pd.DataFrame:
+# EDGAR ticker→CIK map (loaded once, shared across all calls)
+_EDGAR_CIK_MAP: dict[str, str] = {}
+
+def _load_edgar_cik_map() -> dict[str, str]:
+    """Fetch the EDGAR ticker→CIK mapping (free, no key required)."""
+    global _EDGAR_CIK_MAP
+    if _EDGAR_CIK_MAP:
+        return _EDGAR_CIK_MAP
     try:
-        t = yf.Ticker(ticker)
-        hist = t.earnings_history
-        if hist is None or hist.empty:
-            return pd.DataFrame()
-        hist = hist.copy().reset_index()
-        hist["ticker"] = ticker
-        # Standardise column names
-        hist.columns = [c.lower().replace(" ", "_") for c in hist.columns]
-        return hist
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={**_EDGAR_HEADERS, "Host": "www.sec.gov"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _EDGAR_CIK_MAP = {
+            v["ticker"].upper(): str(v["cik_str"]).zfill(10)
+            for v in data.values()
+        }
+        log.info("    EDGAR CIK map loaded: %d tickers", len(_EDGAR_CIK_MAP))
     except Exception as exc:
-        log.debug("Earnings %s: %s", ticker, exc)
+        log.warning("    EDGAR CIK map fetch failed: %s", exc)
+    return _EDGAR_CIK_MAP
+
+
+def fetch_earnings_edgar(ticker: str) -> pd.DataFrame:
+    """
+    Fetch historical quarterly EPS (diluted) from SEC EDGAR XBRL.
+    Returns actual reported EPS going back to ~2010 for S&P 500 companies.
+    No API key required. Rate-limit: 10 req/s max per SEC fair-use policy.
+    """
+    cik_map = _load_edgar_cik_map()
+    cik = cik_map.get(ticker.upper())
+    if not cik:
+        return pd.DataFrame()
+    try:
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        resp = requests.get(
+            url,
+            headers=_EDGAR_HEADERS,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        facts = resp.json()
+        # Try diluted EPS first, fall back to basic EPS
+        eps_data = (
+            facts.get("facts", {})
+                 .get("us-gaap", {})
+                 .get("EarningsPerShareDiluted",
+                      facts.get("facts", {})
+                           .get("us-gaap", {})
+                           .get("EarningsPerShareBasic", {}))
+        )
+        if not eps_data:
+            return pd.DataFrame()
+
+        rows = []
+        for unit_type, entries in eps_data.get("units", {}).items():
+            for e in entries:
+                # Only quarterly filings (10-Q) and annual (10-K), not amendments
+                form = e.get("form", "")
+                if form not in ("10-Q", "10-K"):
+                    continue
+                # "end" = period end date; "filed" = when SEC received the filing
+                period_end = e.get("end")
+                filed_date = e.get("filed")
+                val        = e.get("val")
+                if not period_end or val is None:
+                    continue
+                rows.append({
+                    "ticker":              ticker,
+                    "period_end":          period_end,
+                    "epsactual":           float(val),
+                    "epsestimate":         None,   # EDGAR has no consensus estimates
+                    "epsdifference":       None,
+                    "surprisepercent":     None,
+                    "form":                form,
+                    "event_timestamp":     period_end,
+                    # PiT: the value was only known after the SEC filing date
+                    "knowledge_timestamp": filed_date or period_end,
+                    "source":              "SEC_EDGAR",
+                })
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        # Keep only rows within our study window
+        df["period_ts"] = pd.to_datetime(df["period_end"], errors="coerce")
+        df = df[df["period_ts"] >= pd.Timestamp(START_EQUITY.date())]
+        # De-duplicate: same (ticker, period_end, form) — keep latest filing
+        df = df.sort_values("knowledge_timestamp").drop_duplicates(
+            subset=["ticker", "period_end", "form"], keep="last"
+        )
+        return df.drop(columns=["period_ts"]).reset_index(drop=True)
+    except Exception as exc:
+        log.debug("EDGAR earnings %s: %s", ticker, exc)
         return pd.DataFrame()
 
 
+def fetch_earnings_one(ticker: str) -> pd.DataFrame:
+    """
+    Fetch earnings: EDGAR for full history, yfinance for recent estimates.
+    Merges both sources — EDGAR actual EPS wins on conflict.
+    """
+    # --- SEC EDGAR: actual reported EPS, full history since ~2010 ---
+    edgar_df = fetch_earnings_edgar(ticker)
+
+    # --- yfinance: last 4 quarters with analyst estimates & surprise ---
+    yf_df = pd.DataFrame()
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.earnings_history
+        if hist is not None and not hist.empty:
+            hist = hist.copy().reset_index()
+            hist["ticker"] = ticker
+            hist.columns = [c.lower().replace(" ", "_") for c in hist.columns]
+            # Standardise date column name
+            for c in hist.columns:
+                if c.lower() in ("quarter", "period", "date", "index") or \
+                   "period" in c.lower() or "quarter" in c.lower():
+                    hist = hist.rename(columns={c: "period_end"})
+                    break
+            if "period_end" in hist.columns:
+                hist["period_end"] = hist["period_end"].astype(str).str[:10]
+                hist["event_timestamp"]     = hist["period_end"]
+                hist["knowledge_timestamp"] = hist["period_end"]
+                hist["source"] = "yfinance"
+                yf_df = hist
+    except Exception as exc:
+        log.debug("yfinance earnings %s: %s", ticker, exc)
+
+    # Merge: prefer EDGAR for actuals, yfinance for estimates
+    if edgar_df.empty and yf_df.empty:
+        return pd.DataFrame()
+    if edgar_df.empty:
+        return yf_df
+    if yf_df.empty:
+        return edgar_df
+
+    # Merge on period_end: fill in estimates from yfinance where available
+    merged = edgar_df.copy()
+    yf_lookup = yf_df.set_index("period_end")
+    for col in ("epsestimate", "epsdifference", "surprisepercent"):
+        if col in yf_lookup.columns:
+            merged[col] = merged["period_end"].map(yf_lookup[col])
+    return merged
+
+
 async def fetch_all_earnings(tickers: list[str]) -> pd.DataFrame:
-    log.info("💰  Fetching earnings history …")
+    log.info("💰  Fetching earnings history (SEC EDGAR + yfinance) …")
     loop = asyncio.get_running_loop()
     frames = []
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers, 1):
         df = await loop.run_in_executor(None, fetch_earnings_one, ticker)
         if not df.empty:
             frames.append(df)
-        await asyncio.sleep(0.2)
+        # SEC fair-use: max 10 req/s — 0.15s delay keeps us well under
+        await asyncio.sleep(0.15)
+        if i % 50 == 0:
+            log.info("    earnings %d/%d …", i, len(tickers))
     result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    log.info("    → %d earnings records", len(result))
+    log.info("    → %d earnings records across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
     return result
 
 

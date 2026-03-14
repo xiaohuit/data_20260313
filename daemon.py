@@ -282,28 +282,19 @@ def job_earnings() -> None:
     now = datetime.now(UTC)
     loop = asyncio.new_event_loop()
 
-    for ticker in _get_tickers():
+    tickers = _get_tickers()
+    log.info("  Processing %d tickers (EDGAR + yfinance)", len(tickers))
+    for ticker in tickers:
         try:
             df = fetch_earnings_one(ticker)
             if df.empty:
                 continue
-            # Standardise date column to "period_end" for PK
-            # yfinance uses "quarter" as the index name after reset_index()
-            col_map = {}
-            for c in df.columns:
-                if c.lower() in ("quarter", "period", "date", "index") or \
-                   "period" in c.lower() or "quarter" in c.lower():
-                    col_map[c] = "period_end"
-                    break
-            if col_map:
-                df = df.rename(columns=col_map)
             n = storage.append("earnings", df)
             total += n
             STATE.set_last_fetched("earnings", ticker, now)
         except Exception as exc:
             log.error("  earnings %s FAILED: %s", ticker, exc)
 
-    loop.close()
     _log_job("earnings", total)
 
 

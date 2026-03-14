@@ -46,7 +46,7 @@ PK = {
     "indicators": ["event_timestamp", "ticker"],
     "macro":      ["event_timestamp", "indicator_code", "revision_number"],
     "insider":    ["ticker_queried", "trade date", "insider name", "trade type", "qty"],
-    "earnings":   ["ticker", "period_end"],
+    "earnings":   ["ticker", "period_end", "form"],
     "universe":   ["ticker"],
 }
 
