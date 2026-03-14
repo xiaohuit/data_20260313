@@ -39,8 +39,18 @@ log = logging.getLogger(__name__)
 
 UTC = timezone.utc
 DATA_DIR = Path("./data")
-START = datetime(2020, 1, 1, tzinfo=UTC)
 END   = datetime.now(UTC)
+
+# OHLCV/indicators/earnings: 15 years of daily bars gives models enough
+# data to learn across multiple market cycles (2008 recovery, 2020 crash, etc.)
+START_EQUITY = datetime(2010, 1, 1, tzinfo=UTC)
+
+# Macro (FRED): go back to 1990 — covers multiple recessions, rate cycles,
+# and inflation regimes that are critical for macro-aware models
+START_MACRO = datetime(1990, 1, 1, tzinfo=UTC)
+
+# Backward-compat alias used by any code that still references START
+START = START_EQUITY
 
 # Minimal bootstrap list — used ONLY when no universe has ever been stored yet.
 # The real universe is fetched live from Wikipedia (S&P 500 + NASDAQ 100) and
@@ -207,7 +217,7 @@ def _market_close_utc(ts: pd.Timestamp) -> str:
 def fetch_ohlcv_one(ticker: str) -> pd.DataFrame:
     t = yf.Ticker(ticker)
     df = t.history(
-        start=START.strftime("%Y-%m-%d"),
+        start=START_EQUITY.strftime("%Y-%m-%d"),
         end=END.strftime("%Y-%m-%d"),
         interval="1d",
         auto_adjust=False,
@@ -233,7 +243,7 @@ def fetch_ohlcv_one(ticker: str) -> pd.DataFrame:
 
 async def fetch_all_ohlcv(tickers: list[str]) -> pd.DataFrame:
     log.info("📈  Downloading OHLCV for %d tickers (%s → %s) …",
-             len(tickers), START.date(), END.date())
+             len(tickers), START_EQUITY.date(), END.date())
     loop = asyncio.get_running_loop()
     frames = []
     for i, ticker in enumerate(tickers, 1):
@@ -310,7 +320,7 @@ async def fetch_fred_series(code: str, series_id: str) -> pd.DataFrame:
     url = (
         f"https://api.stlouisfed.org/fred/series/observations"
         f"?series_id={series_id}"
-        f"&observation_start={START.strftime('%Y-%m-%d')}"
+        f"&observation_start={START_MACRO.strftime('%Y-%m-%d')}"
         f"&observation_end={END.strftime('%Y-%m-%d')}"
         f"&api_key={api_key}&file_type=json"
     ) if api_key else (
@@ -354,7 +364,7 @@ async def fetch_fred_series(code: str, series_id: str) -> pd.DataFrame:
             else:
                 df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce")
                 df_raw = df_raw.dropna(subset=[date_col])
-                df_raw = df_raw[df_raw[date_col] >= pd.Timestamp(START.date())]
+                df_raw = df_raw[df_raw[date_col] >= pd.Timestamp(START_MACRO.date())]
                 for _, row in df_raw.iterrows():
                     raw_val = str(row[val_col]).strip()
                     if raw_val in (".", "", "nan"):
@@ -647,7 +657,8 @@ def save(df: pd.DataFrame, subdir: str, filename: str) -> None:
 async def main() -> None:
     log.info("=" * 65)
     log.info("  FINANCIAL DATA PIPELINE — STANDALONE CRAWLER RUN")
-    log.info("  Start: %s  |  End: %s", START.date(), END.date())
+    log.info("  Equity start: %s  |  Macro start: %s  |  End: %s",
+             START_EQUITY.date(), START_MACRO.date(), END.date())
     log.info("=" * 65)
 
     # 1. Universe (live from Wikipedia: S&P 500 + NASDAQ 100)

@@ -19,7 +19,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 STATE_FILE = Path("./data/.state.json")
-_EPOCH = "2019-12-31T00:00:00+00:00"   # default start if no checkpoint exists
+_EPOCH = "2009-12-31T00:00:00+00:00"   # default start if no checkpoint exists (matches START_EQUITY)
 
 
 class StateStore:

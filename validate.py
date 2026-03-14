@@ -235,7 +235,7 @@ def validate_macro() -> None:
     # Sanity ranges
     sanity = {
         "FED_FUNDS_RATE": (0, 25),
-        "CPI_YOY":        (200, 400),   # index level, not YoY %
+        "CPI_YOY":        (100, 400),   # index level (was ~130 in 1990, ~327 today)
         "UNEMPLOYMENT":   (2, 20),
         "10Y_YIELD":      (0, 20),
         "VIX":            (5, 90),
