@@ -16,6 +16,7 @@ Schedule (all times US/Eastern):
   │ earnings           │ Mon-Fri 18:35          │ After market close │
   │ valuations         │ Mon-Fri 18:45          │ After indicators   │
   │ dividends          │ Mon-Fri 19:00          │ After earnings     │
+  │ events_8k          │ Mon-Fri 20:30          │ After insider      │
   │ insider_trades     │ Mon-Fri 20:00          │ SEC filing lag     │
   │ macro_fred         │ Daily   07:00          │ FRED publishes AM  │
   │ financials         │ Sat     06:00          │ Weekly, low urgency│
@@ -59,6 +60,7 @@ from run_crawler import (
     compute_valuations_one,
     compute_dividends_one,
     fetch_earnings_one,
+    fetch_8k_one,
     fetch_financials_edgar,
     fetch_fred_series,
     fetch_insider_trades,
@@ -349,6 +351,42 @@ def job_valuations() -> None:
     _log_job("valuations", total)
 
 
+# ── Job: 8-K material event filings ──────────────────────────────────────────
+
+def job_events_8k() -> None:
+    """
+    Fetch 8-K / 8-K/A filing metadata from SEC EDGAR submissions API.
+    Incremental: each ticker is checkpointed; only newly filed 8-Ks are stored.
+    Runs Mon-Fri 20:30 — after market-hours filings have had time to land.
+    """
+    log.info("── JOB: events_8k ────────────────────────────────────")
+    total = 0
+    now   = datetime.now(UTC)
+
+    tickers = _get_tickers()
+    log.info("  Fetching 8-K filings for %d tickers (SEC EDGAR)", len(tickers))
+
+    for ticker in tickers:
+        since = _since("events_8k", ticker)
+        try:
+            df = fetch_8k_one(ticker)
+            if df.empty:
+                continue
+            # Filter to only new filings since last checkpoint
+            df["filing_ts"] = pd.to_datetime(df["event_timestamp"], utc=True)
+            df = df[df["filing_ts"] >= since].drop(columns=["filing_ts"])
+            n = storage.append("events_8k", df)
+            total += n
+            if n:
+                log.debug("  events_8k %-6s +%d", ticker, n)
+            STATE.set_last_fetched("events_8k", ticker, now)
+            import time as _time; _time.sleep(0.15)   # SEC rate limit
+        except Exception as exc:
+            log.error("  events_8k %s FAILED: %s", ticker, exc)
+
+    _log_job("events_8k", total)
+
+
 # ── Job: Fundamental financials ───────────────────────────────────────────────
 
 def job_financials() -> None:
@@ -524,6 +562,10 @@ def build_scheduler() -> BlockingScheduler:
                       hour=20, minute=0,  id="insider_trades",
                       max_instances=1, misfire_grace_time=3600)
 
+    scheduler.add_job(job_events_8k,  "cron", day_of_week="mon-fri",
+                      hour=20, minute=30, id="events_8k",
+                      max_instances=1, misfire_grace_time=3600)
+
     # ── Macro: every day at 7 AM (FRED publishes morning releases) ───────────
     scheduler.add_job(job_macro,      "cron",
                       hour=7, minute=0,  id="macro_fred",
@@ -549,7 +591,8 @@ def run_all_once() -> None:
     """Run every job immediately in sequence (for --once mode)."""
     log.info("Running all jobs once …")
     for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
-               job_dividends, job_macro, job_earnings, job_financials, job_insider):
+               job_dividends, job_macro, job_earnings, job_financials,
+               job_events_8k, job_insider):
         try:
             fn()
         except Exception as exc:
@@ -588,7 +631,8 @@ def main() -> None:
     # Run all jobs immediately on startup to catch up on any missed data
     log.info("Initial catch-up run …")
     for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
-               job_dividends, job_macro, job_earnings, job_financials, job_insider):
+               job_dividends, job_macro, job_earnings, job_financials,
+               job_events_8k, job_insider):
         try:
             fn()
         except Exception as exc:

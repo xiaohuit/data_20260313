@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -938,6 +939,155 @@ async def fetch_all_earnings(tickers: list[str]) -> pd.DataFrame:
             log.info("    earnings %d/%d …", i, len(tickers))
     result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     log.info("    → %d earnings records across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6b. 8-K material event filings (SEC EDGAR submissions API — free, no key)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 8-K item codes that matter most for long-term fundamental investors
+_8K_ITEM_FLAGS = {
+    "has_earnings":          "2.02",   # Results of Operations (earnings release)
+    "has_exec_change":       "5.02",   # Director / Officer departure or appointment
+    "has_ma":                "2.01",   # Completion of Acquisition / Disposition
+    "has_material_agreement":"1.01",   # Entry into Material Definitive Agreement
+    "has_debt_obligation":   "2.03",   # Creation of Direct Financial Obligation
+    "has_auditor_change":    "4.01",   # Change of Certifying Accountant (red flag)
+    "has_bankruptcy":        "1.03",   # Bankruptcy or Receivership (red flag)
+    "has_delisting":         "3.01",   # Notice of Delisting (red flag)
+}
+
+
+def fetch_8k_one(ticker: str) -> pd.DataFrame:
+    """
+    Fetch 8-K filing metadata for one ticker from SEC EDGAR submissions API.
+
+    Uses https://data.sec.gov/submissions/CIK{cik}.json — free, no key required.
+    Paginates through all available history (back to ~2010 for S&P 500 companies).
+
+    Returns one row per 8-K / 8-K/A filing with:
+      accession_number   — unique EDGAR filing ID
+      filing_date        — date filing was accepted by SEC (= knowledge_timestamp)
+      items              — raw item string, e.g. "2.02,7.01"
+      has_earnings       — item 2.02 present (earnings release)
+      has_exec_change    — item 5.02 present (executive departure/appointment)
+      has_ma             — item 2.01 present (M&A completion)
+      has_material_agreement — item 1.01
+      has_debt_obligation    — item 2.03
+      has_auditor_change     — item 4.01
+      has_bankruptcy         — item 1.03
+      has_delisting          — item 3.01
+
+    SEC rate limit: ≤ 10 req/s.  Caller sleeps 0.15s between tickers.
+    Pagination requests within this function sleep 0.12s each.
+    """
+    cik_map = _load_edgar_cik_map()
+    cik = cik_map.get(ticker.upper())
+    if not cik:
+        return pd.DataFrame()
+
+    records: list[dict] = []
+
+    def _parse_filings_block(block: dict) -> None:
+        """Extract 8-K rows from one filings block (recent or paginated)."""
+        forms      = block.get("form",          [])
+        dates      = block.get("filingDate",    [])
+        accessions = block.get("accessionNumber", [])
+        items_list = block.get("items",         [])
+
+        for i, form in enumerate(forms):
+            if form not in ("8-K", "8-K/A"):
+                continue
+            filing_date = dates[i]      if i < len(dates)      else None
+            accession   = accessions[i] if i < len(accessions) else None
+            items_raw   = items_list[i] if i < len(items_list) else ""
+
+            if not filing_date or not accession:
+                continue
+            if filing_date < "2010-01-01":
+                continue   # outside study window — also stops pagination early
+
+            item_set = {x.strip() for x in str(items_raw).split(",") if x.strip()}
+            ts = f"{filing_date}T00:00:00+00:00"
+
+            row = {
+                "ticker":            ticker,
+                "cik":               cik.lstrip("0"),
+                "accession_number":  accession,
+                "form":              form,
+                "event_timestamp":   ts,
+                "knowledge_timestamp": ts,   # EDGAR filings are public immediately
+                "items":             str(items_raw),
+                "source":            "SEC_EDGAR_SUBMISSIONS",
+            }
+            for flag, code in _8K_ITEM_FLAGS.items():
+                row[flag] = int(code in item_set)
+            records.append(row)
+
+    try:
+        # ── Primary submissions URL ───────────────────────────────────────────
+        resp = requests.get(
+            f"https://data.sec.gov/submissions/CIK{cik}.json",
+            headers=_EDGAR_HEADERS,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        data = resp.json()
+
+        _parse_filings_block(data.get("filings", {}).get("recent", {}))
+
+        # ── Pagination for older filings ──────────────────────────────────────
+        for page_file in data.get("filings", {}).get("files", []):
+            fname = page_file.get("name", "")
+            if not fname:
+                continue
+            time.sleep(0.12)
+            pr = requests.get(
+                f"https://data.sec.gov/submissions/{fname}",
+                headers=_EDGAR_HEADERS,
+                timeout=30,
+            )
+            if pr.status_code != 200:
+                continue
+            page_data = pr.json()
+            # Pagination files have the same flat structure as filings.recent
+            _parse_filings_block(page_data)
+            # If the oldest filing on this page is already before 2010, stop
+            dates_on_page = page_data.get("filingDate", [])
+            if dates_on_page and min(dates_on_page) < "2010-01-01":
+                break
+
+    except Exception as exc:
+        log.debug("8-K %s: %s", ticker, exc)
+        return pd.DataFrame()
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    # Deduplicate on primary key (handles 8-K/A amendments)
+    df = df.sort_values("knowledge_timestamp").drop_duplicates(
+        subset=["ticker", "accession_number"], keep="last"
+    )
+    return df.reset_index(drop=True)
+
+
+async def fetch_all_8k(tickers: list[str]) -> pd.DataFrame:
+    log.info("📋  Fetching 8-K filings (SEC EDGAR) for %d tickers …", len(tickers))
+    loop = asyncio.get_running_loop()
+    frames = []
+    for i, ticker in enumerate(tickers, 1):
+        df = await loop.run_in_executor(None, fetch_8k_one, ticker)
+        if not df.empty:
+            frames.append(df)
+        await asyncio.sleep(0.15)
+        if i % 50 == 0:
+            log.info("    8-K %d/%d …", i, len(tickers))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d 8-K filings across %d tickers",
              len(result), result["ticker"].nunique() if not result.empty else 0)
     return result
 

@@ -50,6 +50,7 @@ PK = {
     "earnings":    ["ticker", "period_end", "form"],
     "financials":  ["ticker", "period_end", "form"],
     "dividends":   ["ticker", "year"],
+    "events_8k":   ["ticker", "accession_number"],
     "universe":    ["ticker"],
 }
 
@@ -63,6 +64,7 @@ PARTITION_COLS = {
     "earnings":    ["ticker", "year"],
     "financials":  ["ticker", "year"],
     "dividends":   ["ticker"],
+    "events_8k":   ["ticker", "year"],
 }
 
 
@@ -94,6 +96,9 @@ def _add_partition_cols(df: pd.DataFrame, table: str) -> pd.DataFrame:
             ts = pd.to_datetime(df["event_timestamp"], errors="coerce", utc=True)
         else:
             ts = pd.Series([pd.Timestamp.now(tz="UTC")] * len(df), index=df.index)
+        df["year"] = ts.dt.year.fillna(9999).astype(int).astype(str)
+    elif table == "events_8k":
+        ts = pd.to_datetime(df["event_timestamp"], errors="coerce", utc=True)
         df["year"] = ts.dt.year.fillna(9999).astype(int).astype(str)
     return df
 
@@ -228,7 +233,7 @@ def read_all(table: str) -> pd.DataFrame:
 def row_counts() -> dict[str, int]:
     """Quick audit: how many rows are stored per table."""
     counts = {}
-    for table in ("ohlcv", "indicators", "valuations", "macro", "insider", "earnings", "financials", "dividends", "universe"):
+    for table in ("ohlcv", "indicators", "valuations", "macro", "insider", "earnings", "financials", "dividends", "events_8k", "universe"):
         root = DATA_ROOT / table
         if not root.exists():
             counts[table] = 0

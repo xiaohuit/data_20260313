@@ -38,7 +38,7 @@ log = logging.getLogger("validate")
 import storage, state as state_mod
 from daemon import (
     job_ohlcv, job_indicators, job_valuations, job_dividends, job_macro,
-    job_earnings, job_financials, job_insider, TICKERS,
+    job_earnings, job_financials, job_events_8k, job_insider, TICKERS,
 )
 
 UTC = timezone.utc
@@ -516,11 +516,79 @@ def validate_dividends() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11  Partition integrity
+# 11  8-K material event filings
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_events_8k() -> None:
+    log.info("\n── 11  8-K Material Events ──────────────────────────────")
+    df = storage.read_all("events_8k")
+
+    if df.empty:
+        check("events_8k loaded", False, "empty"); return
+    check("events_8k loaded", True, f"{len(df):,} rows")
+
+    tickers_covered = df["ticker"].nunique()
+    check("events_8k covers ≥ 400 tickers", tickers_covered >= 400,
+          f"{tickers_covered} tickers")
+
+    # Date range
+    df["event_ts"] = pd.to_datetime(df["event_timestamp"], utc=True)
+    earliest = df["event_ts"].min()
+    check("events_8k history starts ≤ 2011",
+          earliest <= pd.Timestamp("2011-01-01", tz="UTC"),
+          f"earliest={earliest.date()}")
+
+    # All should be 8-K or 8-K/A
+    forms = df["form"].value_counts().to_dict() if "form" in df.columns else {}
+    check("only 8-K forms present",
+          all(f in ("8-K", "8-K/A") for f in forms),
+          str(forms))
+
+    # Boolean flag columns should be 0 or 1
+    flag_cols = [c for c in df.columns if c.startswith("has_")]
+    check("flag columns present", len(flag_cols) >= 6,
+          f"found: {flag_cols}")
+    if flag_cols:
+        bad_flags = df[flag_cols].isin([0, 1]).all().all() or \
+                    df[flag_cols].notna().all().all()
+        vals = df[flag_cols].stack().value_counts().to_dict()
+        check("flag values are 0/1", set(vals.keys()) <= {0, 1},
+              str(dict(list(vals.items())[:4])))
+
+    # Earnings releases: most large-cap companies file 4× per year
+    if "has_earnings" in df.columns:
+        earnings_8k = df[df["has_earnings"] == 1]
+        check("earnings 8-K filings present", len(earnings_8k) > 1000,
+              f"{len(earnings_8k):,} earnings releases")
+
+    # No look-ahead: knowledge_timestamp == event_timestamp for 8-Ks
+    # (filings are public immediately upon SEC acceptance)
+    df["kt"] = pd.to_datetime(df["knowledge_timestamp"], utc=True)
+    lookahead = df[df["kt"] > df["event_ts"] + pd.Timedelta(days=1)]
+    check("events_8k no future knowledge_ts", len(lookahead) == 0,
+          f"{len(lookahead)} anomalies" if not lookahead.empty else "OK")
+
+    # Spot check: AAPL files earnings 8-K (item 2.02) each October
+    aapl = df[(df["ticker"] == "AAPL") & (df["has_earnings"] == 1)].copy() \
+        if "ticker" in df.columns else pd.DataFrame()
+    if not aapl.empty:
+        aapl_oct = aapl[aapl["event_ts"].dt.month.isin([10, 11])]
+        check("AAPL has October earnings 8-Ks", len(aapl_oct) >= 5,
+              f"{len(aapl_oct)} October/November earnings filings")
+
+    # Accession numbers should be unique per ticker
+    if "accession_number" in df.columns:
+        dups = df.duplicated(subset=["ticker", "accession_number"])
+        check("no duplicate accession numbers", dups.sum() == 0,
+              f"{dups.sum()} duplicates" if dups.any() else "OK")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12  Partition integrity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_partitions() -> None:
-    log.info("\n── 11  Partition file integrity ─────────────────────────")
+    log.info("\n── 12  Partition file integrity ─────────────────────────")
     import pyarrow.parquet as pq
 
     data_root = Path("./data")
@@ -702,6 +770,7 @@ def main() -> int:
     validate_financials()
     validate_valuations()
     validate_dividends()
+    validate_events_8k()
     validate_partitions()
     validate_incremental_append()
     validate_idempotency()
