@@ -37,7 +37,7 @@ log = logging.getLogger("validate")
 
 import storage, state as state_mod
 from daemon import (
-    job_ohlcv, job_indicators, job_valuations, job_macro,
+    job_ohlcv, job_indicators, job_valuations, job_dividends, job_macro,
     job_earnings, job_financials, job_insider, TICKERS,
 )
 
@@ -448,11 +448,79 @@ def validate_valuations() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10  Partition integrity
+# 10  Dividend history
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_dividends() -> None:
+    log.info("\n── 10  Dividend History ─────────────────────────────────")
+    df = storage.read_all("dividends")
+
+    if df.empty:
+        check("dividends loaded", False, "empty"); return
+    check("dividends loaded", True, f"{len(df):,} rows")
+
+    tickers_with_divs = df["ticker"].nunique()
+    check("dividends covers ≥ 400 tickers", tickers_with_divs >= 400,
+          f"{tickers_with_divs} tickers")
+
+    # Year range: should go back to at least 2011
+    if "year" in df.columns:
+        earliest_yr = int(df["year"].min())
+        check("dividends history starts ≤ 2011", earliest_yr <= 2011,
+              f"earliest year={earliest_yr}")
+
+    # annual_dps should be non-negative
+    if "annual_dps" in df.columns:
+        dps = df["annual_dps"].dropna()
+        bad_dps = dps[dps < 0]
+        check("annual_dps >= 0", len(bad_dps) == 0,
+              f"{len(bad_dps)} negative values" if not bad_dps.empty else
+              f"range [{dps.min():.4f}, {dps.max():.2f}]")
+
+        # Payers: stocks with annual_dps > 0
+        payers = df[df["annual_dps"] > 0]["ticker"].nunique()
+        check("dividend payers ≥ 200 tickers", payers >= 200,
+              f"{payers} payers")
+
+    # Payout ratio should be in [0, 2.0] when present
+    if "payout_ratio" in df.columns:
+        pr = df["payout_ratio"].dropna()
+        if len(pr) > 0:
+            bad_pr = pr[(pr < 0) | (pr > 2.0)]
+            check("payout_ratio in [0, 200%]", len(bad_pr) == 0,
+                  f"{len(bad_pr)} out-of-range" if not bad_pr.empty else
+                  f"range [{pr.min():.3f}, {pr.max():.3f}]")
+
+    # consecutive_growth should be non-negative integer
+    if "consecutive_growth" in df.columns:
+        cg = df["consecutive_growth"].dropna()
+        bad_cg = cg[cg < 0]
+        check("consecutive_growth >= 0", len(bad_cg) == 0,
+              f"{len(bad_cg)} negative" if not bad_cg.empty else
+              f"max streak={int(cg.max())}")
+
+    # Spot check: JNJ should have a long dividend growth streak (Dividend King)
+    jnj = df[df["ticker"] == "JNJ"].copy() if "ticker" in df.columns else pd.DataFrame()
+    if not jnj.empty and "consecutive_growth" in jnj.columns:
+        max_streak = int(jnj["consecutive_growth"].max())
+        check("JNJ has ≥ 10 consecutive growth years", max_streak >= 10,
+              f"max streak={max_streak}")
+
+    # Spot check: AAPL 2023 annual DPS should be ~0.94
+    aapl = df[(df["ticker"] == "AAPL") & (df["year"] == 2023)] \
+        if "ticker" in df.columns else pd.DataFrame()
+    if not aapl.empty and "annual_dps" in aapl.columns:
+        dps_val = float(aapl["annual_dps"].iloc[0])
+        check("AAPL 2023 annual DPS ≈ $0.94", 0.7 < dps_val < 1.2,
+              f"actual=${dps_val:.4f}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11  Partition integrity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_partitions() -> None:
-    log.info("\n── 8  Partition file integrity ──────────────────────────")
+    log.info("\n── 11  Partition file integrity ─────────────────────────")
     import pyarrow.parquet as pq
 
     data_root = Path("./data")
@@ -633,6 +701,7 @@ def main() -> int:
     validate_alternative()
     validate_financials()
     validate_valuations()
+    validate_dividends()
     validate_partitions()
     validate_incremental_append()
     validate_idempotency()

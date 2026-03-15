@@ -14,10 +14,12 @@ Schedule (all times US/Eastern):
   │ ohlcv_daily        │ Mon-Fri 18:05          │ After market close │
   │ indicators         │ Mon-Fri 18:30          │ After OHLCV done   │
   │ earnings           │ Mon-Fri 18:35          │ After market close │
+  │ valuations         │ Mon-Fri 18:45          │ After indicators   │
+  │ dividends          │ Mon-Fri 19:00          │ After earnings     │
   │ insider_trades     │ Mon-Fri 20:00          │ SEC filing lag     │
   │ macro_fred         │ Daily   07:00          │ FRED publishes AM  │
+  │ financials         │ Sat     06:00          │ Weekly, low urgency│
   │ universe           │ Mon     08:00          │ Weekly refresh     │
-  │ congress_trades    │ Sun     10:00          │ Weekly disclosure  │
   └──────────────────────────────────────────────────────────────────┘
 
 Resilience:
@@ -55,6 +57,7 @@ from run_crawler import (
     fetch_ohlcv_one,
     compute_indicators_one,
     compute_valuations_one,
+    compute_dividends_one,
     fetch_earnings_one,
     fetch_financials_edgar,
     fetch_fred_series,
@@ -371,6 +374,48 @@ def job_financials() -> None:
     _log_job("financials", total)
 
 
+# ── Job: Dividend history ─────────────────────────────────────────────────────
+
+def job_dividends() -> None:
+    """
+    Compute annual dividend history (DPS, growth rates, payout ratio, streak)
+    for every ticker.  Pure in-memory computation — no external API calls.
+    Incremental: only re-derives tickers whose checkpoint is stale.
+    """
+    log.info("── JOB: dividends ────────────────────────────────────")
+    total = 0
+    now   = datetime.now(UTC)
+
+    ohlcv_all = storage.read_all("ohlcv")
+    earn_all  = storage.read_all("earnings")
+
+    if ohlcv_all.empty:
+        log.warning("  dividends: ohlcv table empty — skipping")
+        return
+
+    tickers = _get_tickers()
+    log.info("  Computing dividend history for %d tickers", len(tickers))
+
+    for ticker in tickers:
+        try:
+            df = compute_dividends_one(
+                ticker,
+                ohlcv_all[ohlcv_all["ticker"] == ticker],
+                earn_all[earn_all["ticker"] == ticker],
+            )
+            if df.empty:
+                continue
+            n = storage.append("dividends", df)
+            total += n
+            if n:
+                log.debug("  dividends %-6s +%d", ticker, n)
+            STATE.set_last_fetched("dividends", ticker, now)
+        except Exception as exc:
+            log.error("  dividends %s FAILED: %s", ticker, exc)
+
+    _log_job("dividends", total)
+
+
 # ── Job: Universe refresh ─────────────────────────────────────────────────────
 
 def job_universe() -> None:
@@ -467,6 +512,10 @@ def build_scheduler() -> BlockingScheduler:
                       hour=18, minute=45, id="valuations",
                       max_instances=1, misfire_grace_time=3600)
 
+    scheduler.add_job(job_dividends,  "cron", day_of_week="mon-fri",
+                      hour=19, minute=0,  id="dividends",
+                      max_instances=1, misfire_grace_time=3600)
+
     scheduler.add_job(job_earnings,   "cron", day_of_week="mon-fri",
                       hour=18, minute=35, id="earnings",
                       max_instances=1, misfire_grace_time=3600)
@@ -500,7 +549,7 @@ def run_all_once() -> None:
     """Run every job immediately in sequence (for --once mode)."""
     log.info("Running all jobs once …")
     for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
-               job_macro, job_earnings, job_financials, job_insider):
+               job_dividends, job_macro, job_earnings, job_financials, job_insider):
         try:
             fn()
         except Exception as exc:
@@ -539,7 +588,7 @@ def main() -> None:
     # Run all jobs immediately on startup to catch up on any missed data
     log.info("Initial catch-up run …")
     for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
-               job_macro, job_earnings, job_financials, job_insider):
+               job_dividends, job_macro, job_earnings, job_financials, job_insider):
         try:
             fn()
         except Exception as exc:

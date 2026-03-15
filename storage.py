@@ -49,6 +49,7 @@ PK = {
     "insider":     ["ticker_queried", "trade date", "insider name", "trade type", "qty"],
     "earnings":    ["ticker", "period_end", "form"],
     "financials":  ["ticker", "period_end", "form"],
+    "dividends":   ["ticker", "year"],
     "universe":    ["ticker"],
 }
 
@@ -61,6 +62,7 @@ PARTITION_COLS = {
     "insider":     ["ticker_queried", "year"],
     "earnings":    ["ticker", "year"],
     "financials":  ["ticker", "year"],
+    "dividends":   ["ticker"],
 }
 
 
@@ -226,7 +228,7 @@ def read_all(table: str) -> pd.DataFrame:
 def row_counts() -> dict[str, int]:
     """Quick audit: how many rows are stored per table."""
     counts = {}
-    for table in ("ohlcv", "indicators", "valuations", "macro", "insider", "earnings", "financials", "universe"):
+    for table in ("ohlcv", "indicators", "valuations", "macro", "insider", "earnings", "financials", "dividends", "universe"):
         root = DATA_ROOT / table
         if not root.exists():
             counts[table] = 0

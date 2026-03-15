@@ -494,6 +494,138 @@ def compute_all_valuations(tickers: list[str],
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 4b. Dividend history (derived — computed from OHLCV dividends + earnings EPS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_dividends_one(
+    ticker: str,
+    ohlcv_sub: pd.DataFrame,   # OHLCV rows for this ticker only
+    earn_sub: pd.DataFrame,    # earnings rows for this ticker only
+) -> pd.DataFrame:
+    """
+    Compute annual dividend summary for one ticker.
+
+    Returns one row per complete calendar year (≥ 200 trading bars) with:
+      annual_dps         - total dividends per share paid in the calendar year
+      dps_growth_1y      - year-over-year % change in annual DPS
+      dps_growth_3y      - 3-year CAGR of annual DPS
+      dps_growth_5y      - 5-year CAGR of annual DPS
+      payout_ratio       - annual_dps / annual_eps (sum of 4 quarterly 10-Q EPS)
+      consecutive_growth - streak of consecutive years with increasing DPS
+      is_payer           - 1 if annual_dps > 0 else 0
+
+    Knowledge-timestamp = Dec 31 of each year (annual total known at year-end).
+    PiT-correct: only data available on Dec 31 is used.
+    """
+    if ohlcv_sub.empty:
+        return pd.DataFrame()
+
+    price = ohlcv_sub.copy()
+    price["date"] = pd.to_datetime(price["event_timestamp"], utc=True)
+    price = price.sort_values("date")
+
+    if "dividends" not in price.columns:
+        return pd.DataFrame()
+
+    price["dividends"] = pd.to_numeric(price["dividends"], errors="coerce").fillna(0)
+    price["cal_year"] = price["date"].dt.year
+
+    # Annual DPS and bar counts per calendar year
+    annual_dps = price.groupby("cal_year")["dividends"].sum()
+    bar_counts  = price.groupby("cal_year").size()
+
+    # Only include complete calendar years (≥ 200 trading bars)
+    # This excludes partial first/last years and the current in-progress year
+    complete_years = bar_counts[bar_counts >= 200].index
+    annual_dps = annual_dps[annual_dps.index.isin(complete_years)]
+
+    if annual_dps.empty:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({"year": annual_dps.index.astype(int),
+                        "annual_dps": annual_dps.values})
+    df = df.sort_values("year").reset_index(drop=True)
+
+    # Growth rates via CAGR
+    def _cagr(series: pd.Series, n: int) -> pd.Series:
+        prior  = series.shift(n)
+        result = pd.Series(float("nan"), index=series.index, dtype=float)
+        mask   = prior.notna() & (prior > 0) & series.notna() & (series >= 0)
+        result[mask] = (series[mask] / prior[mask]) ** (1.0 / n) - 1
+        return result
+
+    df["dps_growth_1y"] = _cagr(df["annual_dps"], 1)
+    df["dps_growth_3y"] = _cagr(df["annual_dps"], 3)
+    df["dps_growth_5y"] = _cagr(df["annual_dps"], 5)
+
+    # Consecutive years of DPS growth (streak ending at each row)
+    grew = df["annual_dps"] > df["annual_dps"].shift(1)
+    streak, current = [], 0
+    for g in grew:
+        current = (current + 1) if g else 0
+        streak.append(current)
+    df["consecutive_growth"] = streak
+
+    df["is_payer"] = (df["annual_dps"] > 0).astype(int)
+
+    # Payout ratio: annual_dps / annual_eps (sum of 4 quarterly 10-Q EPS)
+    df["payout_ratio"] = float("nan")
+    if not earn_sub.empty and "epsactual" in earn_sub.columns:
+        eq = earn_sub[earn_sub["form"] == "10-Q"].copy() \
+            if "form" in earn_sub.columns else earn_sub.copy()
+        if not eq.empty:
+            eq["kt"] = pd.to_datetime(eq["knowledge_timestamp"], utc=True, errors="coerce")
+            eq["eps_year"] = eq["kt"].dt.year
+            eq["epsactual"] = pd.to_numeric(eq["epsactual"], errors="coerce")
+            ann_eps = eq.groupby("eps_year")["epsactual"].sum().reset_index()
+            ann_eps.columns = ["year", "annual_eps"]
+            df = df.merge(ann_eps, on="year", how="left")
+            mask = df["annual_eps"].notna() & (df["annual_eps"] > 0)
+            df.loc[mask, "payout_ratio"] = (
+                df.loc[mask, "annual_dps"] / df.loc[mask, "annual_eps"]
+            )
+            # Clamp: payout > 200% or < 0 are data artifacts
+            df.loc[df["payout_ratio"] > 2.0, "payout_ratio"] = float("nan")
+            df.loc[df["payout_ratio"] < 0,   "payout_ratio"] = float("nan")
+            df = df.drop(columns=["annual_eps"])
+
+    # Timestamps: Dec 31 of each year (full-year total is known at year-end)
+    df["event_timestamp"]     = df["year"].apply(lambda y: f"{y}-12-31T00:00:00+00:00")
+    df["knowledge_timestamp"] = df["event_timestamp"]
+    df["ticker"] = ticker
+    df["source"] = "computed"
+
+    out_cols = [
+        "ticker", "year", "event_timestamp", "knowledge_timestamp", "source",
+        "annual_dps", "dps_growth_1y", "dps_growth_3y", "dps_growth_5y",
+        "payout_ratio", "consecutive_growth", "is_payer",
+    ]
+    return df[[c for c in out_cols if c in df.columns]].reset_index(drop=True)
+
+
+def compute_all_dividends(tickers: list[str],
+                          ohlcv_all: pd.DataFrame,
+                          earn_all: pd.DataFrame) -> pd.DataFrame:
+    """Compute annual dividend history for all tickers. Tables are pre-loaded."""
+    log.info("💰  Computing dividend history for %d tickers …", len(tickers))
+    frames = []
+    for i, ticker in enumerate(tickers, 1):
+        df = compute_dividends_one(
+            ticker,
+            ohlcv_all[ohlcv_all["ticker"] == ticker],
+            earn_all[earn_all["ticker"] == ticker],
+        )
+        if not df.empty:
+            frames.append(df)
+        if i % 100 == 0:
+            log.info("    dividends %d/%d …", i, len(tickers))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d dividend rows across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 5. Macro data (FRED via direct HTTP — no API key needed for basic series)
 # ─────────────────────────────────────────────────────────────────────────────
 
