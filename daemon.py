@@ -54,6 +54,7 @@ from run_crawler import (
     FRED_SERIES,
     fetch_ohlcv_one,
     compute_indicators_one,
+    compute_valuations_one,
     fetch_earnings_one,
     fetch_financials_edgar,
     fetch_fred_series,
@@ -299,6 +300,52 @@ def job_earnings() -> None:
     _log_job("earnings", total)
 
 
+# ── Job: Valuation ratios ─────────────────────────────────────────────────────
+
+def job_valuations() -> None:
+    """
+    Compute daily P/E, P/B, EV/EBITDA, FCF yield, P/S, dividend yield
+    for every ticker.  Pure in-memory computation — no external API calls.
+    Incremental: only re-derives days since last checkpoint.
+    """
+    log.info("── JOB: valuations ───────────────────────────────────")
+    total = 0
+    now   = datetime.now(UTC)
+
+    # Load all source tables once (shared across tickers)
+    ohlcv_all = storage.read_all("ohlcv")
+    earn_all  = storage.read_all("earnings")
+    fin_all   = storage.read_all("financials")
+
+    if ohlcv_all.empty:
+        log.warning("  valuations: ohlcv table empty — skipping")
+        return
+
+    tickers = _get_tickers()
+    log.info("  Computing valuations for %d tickers", len(tickers))
+
+    for ticker in tickers:
+        since = _since("valuations", ticker)
+        try:
+            df = compute_valuations_one(
+                ticker,
+                ohlcv_all[ohlcv_all["ticker"] == ticker],
+                earn_all[earn_all["ticker"] == ticker],
+                fin_all[fin_all["ticker"] == ticker],
+            )
+            if df.empty:
+                continue
+            df["event_ts_dt"] = pd.to_datetime(df["event_timestamp"], utc=True)
+            df = df[df["event_ts_dt"] >= since].drop(columns=["event_ts_dt"])
+            n = storage.append("valuations", df)
+            total += n
+            STATE.set_last_fetched("valuations", ticker, now)
+        except Exception as exc:
+            log.error("  valuations %s FAILED: %s", ticker, exc)
+
+    _log_job("valuations", total)
+
+
 # ── Job: Fundamental financials ───────────────────────────────────────────────
 
 def job_financials() -> None:
@@ -416,6 +463,10 @@ def build_scheduler() -> BlockingScheduler:
                       hour=18, minute=30, id="indicators",
                       max_instances=1, misfire_grace_time=3600)
 
+    scheduler.add_job(job_valuations, "cron", day_of_week="mon-fri",
+                      hour=18, minute=45, id="valuations",
+                      max_instances=1, misfire_grace_time=3600)
+
     scheduler.add_job(job_earnings,   "cron", day_of_week="mon-fri",
                       hour=18, minute=35, id="earnings",
                       max_instances=1, misfire_grace_time=3600)
@@ -448,7 +499,7 @@ def build_scheduler() -> BlockingScheduler:
 def run_all_once() -> None:
     """Run every job immediately in sequence (for --once mode)."""
     log.info("Running all jobs once …")
-    for fn in (job_universe, job_ohlcv, job_indicators,
+    for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
                job_macro, job_earnings, job_financials, job_insider):
         try:
             fn()
@@ -487,7 +538,7 @@ def main() -> None:
 
     # Run all jobs immediately on startup to catch up on any missed data
     log.info("Initial catch-up run …")
-    for fn in (job_universe, job_ohlcv, job_indicators,
+    for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
                job_macro, job_earnings, job_financials, job_insider):
         try:
             fn()

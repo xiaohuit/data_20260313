@@ -44,6 +44,7 @@ DATA_ROOT = Path("./data")
 PK = {
     "ohlcv":       ["event_timestamp", "ticker", "frequency"],
     "indicators":  ["event_timestamp", "ticker"],
+    "valuations":  ["event_timestamp", "ticker"],
     "macro":       ["event_timestamp", "indicator_code", "revision_number"],
     "insider":     ["ticker_queried", "trade date", "insider name", "trade type", "qty"],
     "earnings":    ["ticker", "period_end", "form"],
@@ -55,6 +56,7 @@ PK = {
 PARTITION_COLS = {
     "ohlcv":       ["year", "month"],
     "indicators":  ["year", "month"],
+    "valuations":  ["year", "month"],
     "macro":       ["indicator_code", "year"],
     "insider":     ["ticker_queried", "year"],
     "earnings":    ["ticker", "year"],
@@ -65,7 +67,7 @@ PARTITION_COLS = {
 def _add_partition_cols(df: pd.DataFrame, table: str) -> pd.DataFrame:
     """Add hive-partition columns derived from event_timestamp (or equivalent)."""
     df = df.copy()
-    if table in ("ohlcv", "indicators"):
+    if table in ("ohlcv", "indicators", "valuations"):
         ts = pd.to_datetime(df["event_timestamp"], utc=True)
         df["year"]  = ts.dt.year.astype(str)
         df["month"] = ts.dt.month.apply(lambda m: f"{m:02d}")
@@ -224,7 +226,7 @@ def read_all(table: str) -> pd.DataFrame:
 def row_counts() -> dict[str, int]:
     """Quick audit: how many rows are stored per table."""
     counts = {}
-    for table in ("ohlcv", "indicators", "macro", "insider", "earnings", "financials", "universe"):
+    for table in ("ohlcv", "indicators", "valuations", "macro", "insider", "earnings", "financials", "universe"):
         root = DATA_ROOT / table
         if not root.exists():
             counts[table] = 0

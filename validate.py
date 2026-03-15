@@ -37,7 +37,7 @@ log = logging.getLogger("validate")
 
 import storage, state as state_mod
 from daemon import (
-    job_ohlcv, job_indicators, job_macro,
+    job_ohlcv, job_indicators, job_valuations, job_macro,
     job_earnings, job_financials, job_insider, TICKERS,
 )
 
@@ -383,7 +383,72 @@ def validate_financials() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9  Partition integrity
+# 9  Valuation ratios
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_valuations() -> None:
+    log.info("\n── 9  Valuation Ratios ──────────────────────────────────")
+    df = storage.read_all("valuations")
+
+    if df.empty:
+        check("valuations loaded", False, "empty"); return
+    check("valuations loaded", True, f"{len(df):,} rows")
+
+    tickers_with_vals = df["ticker"].nunique()
+    check("valuations covers ≥ 400 tickers", tickers_with_vals >= 400,
+          f"{tickers_with_vals} tickers")
+
+    # Date range
+    df["event_ts"] = pd.to_datetime(df["event_timestamp"], utc=True)
+    earliest = df["event_ts"].min()
+    check("valuations history starts ≤ 2011",
+          earliest <= pd.Timestamp("2011-01-01", tz="UTC"),
+          f"earliest={earliest.date()}")
+
+    # P/E sanity: should be positive and < 500 for most rows
+    if "pe_ttm" in df.columns:
+        pe = df["pe_ttm"].dropna()
+        check("pe_ttm has values", len(pe) > 0, f"{len(pe):,} non-null rows")
+        bad_pe = pe[(pe <= 0) | (pe > 500)]
+        check("pe_ttm in (0, 500]", len(bad_pe) == 0,
+              f"{len(bad_pe)} out-of-range" if not bad_pe.empty else
+              f"range [{pe.min():.1f}, {pe.max():.1f}]")
+
+    # P/B sanity
+    if "pb" in df.columns:
+        pb = df["pb"].dropna()
+        bad_pb = pb[(pb <= 0) | (pb > 100)]
+        check("pb in (0, 100]", len(bad_pb) == 0,
+              f"{len(bad_pb)} out-of-range" if not bad_pb.empty else
+              f"range [{pb.min():.1f}, {pb.max():.1f}]")
+
+    # Dividend yield sanity
+    if "dividend_yield" in df.columns:
+        dy = df["dividend_yield"].dropna()
+        bad_dy = dy[(dy < 0) | (dy > 0.5)]
+        check("dividend_yield in [0, 50%]", len(bad_dy) == 0,
+              f"{len(bad_dy)} out-of-range" if not bad_dy.empty else
+              f"range [{dy.min():.3f}, {dy.max():.3f}]")
+
+    # Spot check: AAPL P/E on 2023-06-30 should be ~30-35x
+    aapl = df[df["ticker"] == "AAPL"].copy()
+    if not aapl.empty and "pe_ttm" in df.columns:
+        target = aapl[aapl["event_ts"].dt.date == pd.Timestamp("2023-06-30").date()]
+        if not target.empty:
+            pe_val = target["pe_ttm"].iloc[0]
+            check("AAPL P/E 2023-06-30 ≈ 30-35x",
+                  pe_val is not None and 25 < float(pe_val) < 45,
+                  f"actual={pe_val:.1f}x" if pe_val else "None")
+
+    # No future knowledge_timestamp
+    df["kt"] = pd.to_datetime(df["knowledge_timestamp"], utc=True)
+    lookahead = df[df["kt"] > df["event_ts"] + pd.Timedelta(days=1)]
+    check("valuations: no future knowledge_ts", len(lookahead) == 0,
+          f"{len(lookahead)} anomalies" if not lookahead.empty else "OK")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10  Partition integrity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_partitions() -> None:
@@ -567,6 +632,7 @@ def main() -> int:
     validate_macro()
     validate_alternative()
     validate_financials()
+    validate_valuations()
     validate_partitions()
     validate_incremental_append()
     validate_idempotency()

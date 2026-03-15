@@ -315,7 +315,186 @@ async def compute_all_indicators(ohlcv: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Macro data (FRED via direct HTTP — no API key needed for basic series)
+# 4. Valuation ratios (derived — no external API, computed from stored data)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_valuations_one(
+    ticker: str,
+    ohlcv_sub: pd.DataFrame,   # OHLCV rows for this ticker only
+    earn_sub: pd.DataFrame,    # earnings rows for this ticker only
+    fin_sub: pd.DataFrame,     # financials rows for this ticker only
+) -> pd.DataFrame:
+    """
+    Compute daily valuation ratios for one ticker using PiT-correct joins.
+
+    For each trading day D, only financial data with knowledge_timestamp <= D
+    is used — no look-ahead bias.
+
+    Ratios computed:
+      pe_ttm       — Price / Trailing-12-month EPS (last 4 quarterly reports)
+      pb           — Price / Book value per share
+      ps           — Price / Annual revenue per share  (last 10-K)
+      ev_ebitda    — Enterprise value / EBITDA          (last 10-K)
+      fcf_yield    — Free cash flow per share / Price   (last 10-K)
+      dividend_yield — Trailing-12-month dividends / Price
+    """
+    if ohlcv_sub.empty:
+        return pd.DataFrame()
+
+    # ── 1. Daily price series ─────────────────────────────────────────────────
+    price = ohlcv_sub.copy()
+    price["date"] = pd.to_datetime(price["event_timestamp"], utc=True)
+    price = price.sort_values("date")[["date", "close", "dividends"]].reset_index(drop=True)
+    if len(price) < 5:
+        return pd.DataFrame()
+
+    # Trailing-12-month dividends (rolling 252 trading days)
+    price["div_ttm"] = price["dividends"].fillna(0).rolling(252, min_periods=1).sum()
+
+    # ── 2. TTM EPS — rolling sum of last 4 quarterly EPS reports ─────────────
+    earn_q = earn_sub[earn_sub["form"] == "10-Q"].copy()
+    ttm_eps_lkp = pd.DataFrame(columns=["kt", "ttm_eps"])
+    if not earn_q.empty and "epsactual" in earn_q.columns:
+        earn_q["kt"] = pd.to_datetime(earn_q["knowledge_timestamp"], utc=True)
+        earn_q = earn_q.sort_values("kt").dropna(subset=["epsactual"])
+        earn_q["ttm_eps"] = earn_q["epsactual"].rolling(4, min_periods=2).sum()
+        ttm_eps_lkp = earn_q[["kt", "ttm_eps"]].dropna().drop_duplicates("kt")
+
+    # ── 3. Balance sheet: most recent filing of any type, PiT ────────────────
+    bs_cols = ["total_equity", "shares_outstanding", "lt_debt", "cash"]
+    fin_bs = fin_sub[fin_sub[bs_cols].notna().any(axis=1)].copy() if not fin_sub.empty else pd.DataFrame()
+    bs_lkp = pd.DataFrame(columns=["kt"] + bs_cols)
+    if not fin_bs.empty:
+        fin_bs["kt"] = pd.to_datetime(fin_bs["knowledge_timestamp"], utc=True)
+        fin_bs = fin_bs.sort_values("kt").drop_duplicates("kt", keep="last")
+        bs_lkp = fin_bs[["kt"] + [c for c in bs_cols if c in fin_bs.columns]]
+
+    # ── 4. Annual flow metrics: most recent 10-K, PiT ────────────────────────
+    flow_cols = ["revenue", "operating_income", "depreciation_amortization", "fcf"]
+    fin_annual = fin_sub[fin_sub["form"] == "10-K"].copy() if not fin_sub.empty else pd.DataFrame()
+    flow_lkp = pd.DataFrame(columns=["kt"] + flow_cols)
+    if not fin_annual.empty:
+        fin_annual["kt"] = pd.to_datetime(fin_annual["knowledge_timestamp"], utc=True)
+        fin_annual = fin_annual.sort_values("kt").drop_duplicates("kt", keep="last")
+        flow_lkp = fin_annual[["kt"] + [c for c in flow_cols if c in fin_annual.columns]]
+
+    # ── 5. PiT joins via merge_asof ───────────────────────────────────────────
+    base = price.copy()
+
+    if not ttm_eps_lkp.empty:
+        base = pd.merge_asof(base, ttm_eps_lkp, left_on="date", right_on="kt",
+                             direction="backward").drop(columns=["kt"], errors="ignore")
+    else:
+        base["ttm_eps"] = None
+
+    if not bs_lkp.empty:
+        base = pd.merge_asof(base, bs_lkp, left_on="date", right_on="kt",
+                             direction="backward").drop(columns=["kt"], errors="ignore")
+    else:
+        for c in bs_cols:
+            base[c] = None
+
+    if not flow_lkp.empty:
+        base = pd.merge_asof(base, flow_lkp, left_on="date", right_on="kt",
+                             direction="backward").drop(columns=["kt"], errors="ignore")
+    else:
+        for c in flow_cols:
+            base[c] = None
+
+    # ── 6. Derived metrics ────────────────────────────────────────────────────
+    def _col(name: str) -> pd.Series:
+        """Return column as float64 Series, all-NaN if column absent."""
+        if name in base.columns:
+            return pd.to_numeric(base[name], errors="coerce")
+        return pd.Series(float("nan"), index=base.index, dtype=float)
+
+    def _sdiv(a: pd.Series, b: pd.Series, lo: float = None, hi: float = None) -> pd.Series:
+        """Safe element-wise division; clip to [lo, hi] if given."""
+        a = pd.to_numeric(a, errors="coerce")
+        b = pd.to_numeric(b, errors="coerce")
+        out = pd.Series(float("nan"), index=a.index, dtype=float)
+        mask = b.notna() & (b != 0) & a.notna()
+        out[mask] = a[mask] / b[mask]
+        if lo is not None:
+            out[out < lo] = float("nan")
+        if hi is not None:
+            out[out > hi] = float("nan")
+        return out
+
+    close  = pd.to_numeric(base["close"], errors="coerce")
+    shares = _col("shares_outstanding")
+
+    base["market_cap"]           = close * shares
+    base["book_value_per_share"] = _sdiv(_col("total_equity"), shares)
+    base["revenue_per_share"]    = _sdiv(_col("revenue"),      shares)
+    base["fcf_per_share"]        = _sdiv(_col("fcf"),          shares)
+    lt_debt = _col("lt_debt").fillna(0)
+    cash    = _col("cash").fillna(0)
+    base["enterprise_value"]     = base["market_cap"] + lt_debt - cash
+
+    # P/E TTM
+    base["pe_ttm"]  = _sdiv(close, _col("ttm_eps"),               lo=0,   hi=500)
+    # P/B
+    base["pb"]      = _sdiv(close, _col("book_value_per_share"),   lo=0,   hi=100)
+    # P/S
+    base["ps"]      = _sdiv(close, _col("revenue_per_share"),      lo=0,   hi=200)
+    # EV/EBITDA
+    ebitda = _col("operating_income").fillna(0) + _col("depreciation_amortization").fillna(0)
+    ebitda[ebitda <= 0] = float("nan")
+    base["ebitda"]    = ebitda
+    base["ev_ebitda"] = _sdiv(_col("enterprise_value"), ebitda,    lo=0,   hi=300)
+    # FCF yield
+    base["fcf_yield"]      = _sdiv(_col("fcf_per_share"), close,   lo=-0.5, hi=0.5)
+    # Dividend yield
+    base["dividend_yield"] = _sdiv(_col("div_ttm"), close,         lo=0,   hi=0.5)
+
+    # ── 7. Final output ───────────────────────────────────────────────────────
+    base["ticker"]               = ticker
+    base["event_timestamp"]      = base["date"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    base["knowledge_timestamp"]  = base["date"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    base["source"]               = "computed"
+
+    out_cols = [
+        "ticker", "event_timestamp", "knowledge_timestamp", "source",
+        "close", "market_cap", "enterprise_value", "shares_outstanding",
+        "ttm_eps", "book_value_per_share", "revenue_per_share", "fcf_per_share",
+        "revenue", "fcf", "ebitda",
+        "pe_ttm", "pb", "ps", "ev_ebitda", "fcf_yield", "dividend_yield",
+    ]
+    out = base[[c for c in out_cols if c in base.columns]].copy()
+    str_cols = {"ticker", "event_timestamp", "knowledge_timestamp", "source"}
+    for col in out.columns:
+        if col not in str_cols:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.reset_index(drop=True)
+
+
+def compute_all_valuations(tickers: list[str],
+                           ohlcv_all: pd.DataFrame,
+                           earn_all: pd.DataFrame,
+                           fin_all: pd.DataFrame) -> pd.DataFrame:
+    """Compute daily valuation ratios for all tickers. Tables are pre-loaded."""
+    log.info("💹  Computing valuation ratios for %d tickers …", len(tickers))
+    frames = []
+    for i, ticker in enumerate(tickers, 1):
+        df = compute_valuations_one(
+            ticker,
+            ohlcv_all[ohlcv_all["ticker"] == ticker],
+            earn_all[earn_all["ticker"] == ticker],
+            fin_all[fin_all["ticker"] == ticker],
+        )
+        if not df.empty:
+            frames.append(df)
+        if i % 100 == 0:
+            log.info("    valuations %d/%d …", i, len(tickers))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d valuation rows across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Macro data (FRED via direct HTTP — no API key needed for basic series)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_fred_series(code: str, series_id: str) -> pd.DataFrame:
