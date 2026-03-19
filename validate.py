@@ -6,7 +6,7 @@ Checks (all must pass before daemon is considered healthy):
   2.  OHLCV value sanity   — price > 0, volume > 0, high >= low, no NaN closes
   3.  Adjusted-price logic — adj_close <= close * 1.5 and > 0
   4.  Indicator sanity     — RSI in (0,100), SMA_20 > 0, ATR > 0
-  5.  Macro completeness   — all 8 FRED series present, values in plausible range
+  5.  Macro completeness   — all 11 FRED series present (incl. derived CPI_YOY %), values in plausible range
   6.  Insider data         — columns present, trade dates parseable
   7.  Earnings data        — EPS columns present for equity tickers
   8.  Partition integrity  — every Parquet file readable, no empty files
@@ -16,6 +16,8 @@ Checks (all must pass before daemon is considered healthy):
   11. Cross-partition read — DuckDB glob query returns consistent total
   12. No look-ahead        — knowledge_timestamp <= event_timestamp + 5 days
                              (sanity bound; real PiT check is in run_crawler.py)
+  14. Sector classification — all GICS sectors present, spot checks for AAPL/JPM
+  15. Quality metrics       — ROIC/CAGR/consistency sanity ranges, AAPL spot check
 """
 
 import sys
@@ -38,7 +40,9 @@ log = logging.getLogger("validate")
 import storage, state as state_mod
 from daemon import (
     job_ohlcv, job_indicators, job_valuations, job_dividends, job_macro,
-    job_earnings, job_financials, job_events_8k, job_insider, TICKERS,
+    job_earnings, job_financials, job_events_8k, job_insider,
+    job_universe_history, job_short_interest, TICKERS,
+    job_sectors, job_quality_metrics,
 )
 
 UTC = timezone.utc
@@ -79,30 +83,54 @@ def validate_ohlcv() -> None:
     bar_counts = df.groupby("ticker").size()
     today = pd.Timestamp.now(tz="UTC")
 
+    # Load delisted (removed) tickers from universe_history — these are expected to
+    # have incomplete/stale data since they were acquired or delisted.
+    _uh = storage.read_all("universe_history")
+    delisted_tickers = set()
+    if not _uh.empty and "action" in _uh.columns and "ticker" in _uh.columns:
+        delisted_tickers = set(_uh[_uh["action"] == "removed"]["ticker"].unique())
+
+    # Foreign cross-listings with thin US volume: primary market is non-US so daily
+    # US bar coverage is legitimately sparse.  Exclude from the ≥90% bar checks.
+    _THIN_VOLUME_FOREIGN = {"FER", "AMCR", "SW"}   # Ferrovial (ES), Amcor (AU), Smurfit WestRock (IE)
+    delisted_tickers = delisted_tickers | _THIN_VOLUME_FOREIGN
+
     # Check 1: every ticker's history should be "complete" — meaning it has ≥90%
     # of the trading bars it could possibly have since its first-ever traded date.
-    # This detects tickers where we fetched only partial history, regardless of IPO.
-    possible_bars_early = earliest.apply(
-        lambda e: max(30, int((today - e).days * 252 / 365))
+    # Delisted tickers: use their last bar date as the end of their "possible" window.
+    latest = df.groupby("ticker")["event_ts"].max()
+    def _possible_bars(ticker: str) -> int:
+        start = earliest[ticker]
+        end = latest[ticker] if ticker in delisted_tickers else today
+        return max(30, int((end - start).days * 252 / 365))
+    possible_bars_early = pd.Series(
+        {t: _possible_bars(t) for t in bar_counts.index}, dtype=float
     )
     coverage = bar_counts / possible_bars_early.reindex(bar_counts.index, fill_value=1)
-    incomplete = coverage[coverage < 0.90]
-    n_post_2020 = (earliest > pd.Timestamp("2020-02-01", tz="UTC")).sum()
+    # Only check completeness for active (non-delisted) tickers
+    active_bar_counts = bar_counts[~bar_counts.index.isin(delisted_tickers)]
+    active_earliest   = earliest[~earliest.index.isin(delisted_tickers)]
+    active_incomplete = coverage[
+        (coverage < 0.90) & (~coverage.index.isin(delisted_tickers))
+    ]
+    n_post_2020 = (active_earliest > pd.Timestamp("2020-02-01", tz="UTC")).sum()
     check("history complete (≥90% of possible bars since IPO)",
-          incomplete.empty,
-          f"{len(incomplete)} tickers under 90%: " +
-          ", ".join(f"{t}={coverage[t]:.0%}" for t in incomplete.index[:5])
-          if not incomplete.empty
-          else f"OK — {len(bar_counts)} tickers, {n_post_2020} post-2020 IPOs")
+          active_incomplete.empty,
+          f"{len(active_incomplete)} tickers under 90%: " +
+          ", ".join(f"{t}={coverage[t]:.0%}" for t in active_incomplete.index[:5])
+          if not active_incomplete.empty
+          else f"OK — {len(active_bar_counts)} active tickers, {n_post_2020} post-2020 IPOs")
 
-    latest = df.groupby("ticker")["event_ts"].max()
     cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=10)
-    stale = latest[latest < cutoff]
+    # Exclude delisted tickers from freshness check — they have no recent data by design
+    stale = latest[(latest < cutoff) & (~latest.index.isin(delisted_tickers))]
     check("data fresh (within 10 days)", len(stale) == 0,
           f"stale: {stale.to_dict()}" if not stale.empty else "OK")
 
-    min_coverage = coverage.min() if not coverage.empty else 1.0
-    min_ticker   = coverage.idxmin() if not coverage.empty else "N/A"
+    # Exclude delisted tickers from min-coverage check
+    active_coverage = coverage[~coverage.index.isin(delisted_tickers)]
+    min_coverage = active_coverage.min() if not active_coverage.empty else 1.0
+    min_ticker   = active_coverage.idxmin() if not active_coverage.empty else "N/A"
     check("≥ 90% of possible bars per ticker",  min_coverage >= 0.90,
           f"min={min_coverage:.1%} ({min_ticker})")
 
@@ -228,18 +256,26 @@ def validate_macro() -> None:
         df = storage.read_all("macro")
         code_col = "indicator_code" if "indicator_code" in df.columns else "series_id"
     codes_found = set(df[code_col].unique())
-    missing = [c for c in FRED_SERIES if c not in codes_found]
-    check("all 8 FRED series present", len(missing) == 0,
+    # FRED_SERIES keys are base series; CPI_YOY is a derived series stored separately
+    expected_codes = set(FRED_SERIES.keys()) | {"CPI_YOY"}
+    missing = [c for c in expected_codes if c not in codes_found]
+    check("all FRED series present", len(missing) == 0,
           f"missing: {missing}" if missing else f"{len(codes_found)} series")
 
     # Sanity ranges
     sanity = {
         "FED_FUNDS_RATE": (0, 25),
-        "CPI_YOY":        (100, 400),   # index level (was ~130 in 1990, ~327 today)
+        "CPI_INDEX":      (100, 400),   # raw CPI index level (~130 in 1990, ~327 today)
+        "CPI_YOY":        (-5, 20),     # true year-over-year % (usually 0–10)
+        "GDP_GROWTH":     (-40, 40),    # annualised real GDP growth rate (%)
         "UNEMPLOYMENT":   (2, 20),
         "10Y_YIELD":      (0, 20),
+        "2Y_YIELD":       (0, 20),      # short-end yield
         "VIX":            (5, 90),
         "YIELD_CURVE":    (-5, 5),
+        "CONSUMER_CONF":  (40, 120),    # UMich consumer sentiment index (~50–110 historical)
+        "M2":             (2000, 30000),  # M2 in billions USD (~$3.9T in 1990, ~$21T today)
+        "OIL_WTI":        (10, 200),    # WTI crude in USD/barrel
     }
     for code, (lo, hi) in sanity.items():
         sub = df[df["indicator_code"] == code]["value"].dropna()
@@ -314,6 +350,14 @@ def validate_alternative() -> None:
         check("equity tickers have earnings", len(missing_eq) == 0,
               f"missing: {missing_eq}" if missing_eq else "OK")
 
+    # Form check: only 10-K and 10-Q after normalisation; no 8-K, NT 10-K, etc.
+    if "form" in df_e.columns:
+        e_forms = df_e["form"].value_counts().to_dict()
+        unexpected_e_forms = {f for f in e_forms if f not in ("10-K", "10-Q")}
+        check("no unexpected form types in earnings",
+              len(unexpected_e_forms) == 0,
+              f"unexpected: {unexpected_e_forms}" if unexpected_e_forms else "OK")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8  Fundamental financials
@@ -331,11 +375,18 @@ def validate_financials() -> None:
     check("financials covers ≥ 400 tickers", tickers_with_data >= 400,
           f"{tickers_with_data} tickers")
 
-    # Forms present
+    # Forms present — must have both annual and quarterly
     forms = df["form"].value_counts().to_dict() if "form" in df.columns else {}
     check("10-K and 10-Q both present",
           "10-K" in forms and "10-Q" in forms,
           str(forms))
+
+    # No unexpected form types: only 10-K and 10-Q should exist after normalisation.
+    # 10-K/A and 10-Q/A are normalised to base forms; anything else is a pipeline bug.
+    unexpected_forms = {f for f in forms if f not in ("10-K", "10-Q")}
+    check("no unexpected form types in financials",
+          len(unexpected_forms) == 0,
+          f"unexpected: {unexpected_forms}" if unexpected_forms else "OK")
 
     # Date range: should go back to at least 2012
     df["period_ts"] = pd.to_datetime(df["period_end"], errors="coerce", utc=True)
@@ -445,6 +496,15 @@ def validate_valuations() -> None:
     lookahead = df[df["kt"] > df["event_ts"] + pd.Timedelta(days=1)]
     check("valuations: no future knowledge_ts", len(lookahead) == 0,
           f"{len(lookahead)} anomalies" if not lookahead.empty else "OK")
+
+    # TTM revenue coverage: for EDGAR filers with ≥ 4 quarters of history,
+    # most rows should have ttm_revenue populated (verifies implied-Q4 computation).
+    if "ttm_revenue" in df.columns and "ps" in df.columns:
+        ps_rows = df[df["ps"].notna()]
+        if not ps_rows.empty:
+            ttm_rev_fill = ps_rows["ttm_revenue"].notna().mean()
+            check("P/S rows have ttm_revenue ≥ 60%", ttm_rev_fill >= 0.60,
+                  f"{ttm_rev_fill:.1%} of P/S rows have ttm_revenue")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,11 +644,248 @@ def validate_events_8k() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12  Partition integrity
+# 12  Universe membership history
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_universe_history() -> None:
+    log.info("\n── 12  Universe Membership History ─────────────────────")
+    df = storage.read_all("universe_history")
+
+    if df.empty:
+        check("universe_history loaded", False, "empty"); return
+    check("universe_history loaded", True, f"{len(df):,} rows")
+
+    # Should have both S&P 500 and NASDAQ 100 events
+    indices = df["index_name"].value_counts().to_dict() if "index_name" in df.columns else {}
+    check("both indices present",
+          "S&P 500" in indices and "NASDAQ 100" in indices,
+          str(indices))
+
+    # Both add and remove events
+    actions = df["action"].value_counts().to_dict() if "action" in df.columns else {}
+    check("added and removed events present",
+          "added" in actions and "removed" in actions,
+          f"added={actions.get('added',0)}  removed={actions.get('removed',0)}")
+
+    # History should go back at least to 2000 for S&P 500
+    df["event_ts"] = pd.to_datetime(df["event_timestamp"], utc=True)
+    earliest = df["event_ts"].min()
+    check("history starts ≤ 2005",
+          earliest <= pd.Timestamp("2005-01-01", tz="UTC"),
+          f"earliest={earliest.date()}")
+
+    # Removed tickers should outnumber the current universe
+    removed_tickers = df[df["action"] == "removed"]["ticker"].nunique()
+    check("≥ 200 unique removed tickers", removed_tickers >= 200,
+          f"{removed_tickers} unique removed tickers")
+
+    # Spot check: ATVI (Activision, acquired by MSFT 2023) should be in removed
+    atvi_removed = df[(df["ticker"] == "ATVI") & (df["action"] == "removed")]
+    check("ATVI shows as removed", not atvi_removed.empty,
+          f"found {len(atvi_removed)} removal events" if not atvi_removed.empty else "missing")
+
+    # No duplicate events (same ticker+index+action+date)
+    dups = df.duplicated(subset=["ticker", "index_name", "action", "event_date"])
+    check("no duplicate events", dups.sum() == 0,
+          f"{dups.sum()} duplicates" if dups.any() else "OK")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13  Short interest
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_short_interest() -> None:
+    log.info("\n── 13  Short Interest ───────────────────────────────────")
+    df = storage.read_all("short_interest")
+
+    if df.empty:
+        check("short_interest loaded", False, "empty"); return
+    check("short_interest loaded", True, f"{len(df):,} rows")
+
+    tickers_covered = df["ticker"].nunique()
+    check("short_interest covers ≥ 400 tickers", tickers_covered >= 400,
+          f"{tickers_covered} tickers")
+
+    # shares_short should be positive
+    if "shares_short" in df.columns:
+        ss = pd.to_numeric(df["shares_short"], errors="coerce").dropna()
+        bad = ss[ss <= 0]
+        check("shares_short > 0", len(bad) == 0,
+              f"{len(bad)} non-positive" if not bad.empty else
+              f"range [{ss.min():,.0f}, {ss.max():,.0f}]")
+
+    # days_to_cover should be in [0, 100] when present
+    if "days_to_cover" in df.columns:
+        dtc = pd.to_numeric(df["days_to_cover"], errors="coerce").dropna()
+        bad_dtc = dtc[(dtc < 0) | (dtc > 100)]
+        check("days_to_cover in [0, 100]", len(bad_dtc) == 0,
+              f"{len(bad_dtc)} out-of-range" if not bad_dtc.empty else
+              f"range [{dtc.min():.2f}, {dtc.max():.2f}]")
+
+    # short_pct_float should be in [0, 1] when present
+    if "short_pct_float" in df.columns:
+        spf = pd.to_numeric(df["short_pct_float"], errors="coerce").dropna()
+        bad_spf = spf[(spf < 0) | (spf > 1)]
+        check("short_pct_float in [0, 100%]", len(bad_spf) == 0,
+              f"{len(bad_spf)} out-of-range" if not bad_spf.empty else
+              f"range [{spf.min():.3f}, {spf.max():.3f}]")
+
+    # Should have two settlement dates per ticker (current + prior month)
+    dates_per_ticker = df.groupby("ticker")["settlement_date"].nunique()
+    avg_dates = dates_per_ticker.mean()
+    check("≥ 1 settlement date per ticker", (dates_per_ticker >= 1).all(),
+          f"avg {avg_dates:.1f} dates/ticker")
+
+    # PiT: knowledge_timestamp must be > settlement_date (FINRA publishes 14-21 days
+    # after the settlement date; we record knowledge_timestamp = fetch time, so it
+    # must always be strictly after the settlement date).
+    if "knowledge_timestamp" in df.columns and "settlement_date" in df.columns:
+        df["_kt"] = pd.to_datetime(df["knowledge_timestamp"], errors="coerce", utc=True)
+        df["_sd"] = pd.to_datetime(df["settlement_date"],     errors="coerce", utc=True)
+        lookahead_si = df[df["_kt"] <= df["_sd"]].dropna(subset=["_kt", "_sd"])
+        check("short_interest kt > settlement_date (no PiT look-ahead)",
+              len(lookahead_si) == 0,
+              f"{len(lookahead_si)} violations" if not lookahead_si.empty else "OK")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14  Sector classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_sectors() -> None:
+    log.info("\n── 14  Sector Classification ────────────────────────────")
+    df = storage.read_all("sectors")
+
+    if df.empty:
+        log.info("  sectors table empty — running job_sectors() now …")
+        job_sectors()
+        df = storage.read_all("sectors")
+
+    if df.empty:
+        check("sectors loaded", False, "empty after fetch"); return
+    check("sectors loaded", True, f"{len(df):,} rows")
+
+    tickers_covered = df["ticker"].nunique()
+    check("sectors covers ≥ 400 tickers", tickers_covered >= 400,
+          f"{tickers_covered} tickers")
+
+    # All major GICS sectors should appear (yfinance uses "Financial Services")
+    expected_sectors = {"Technology", "Healthcare", "Financial Services",
+                        "Consumer Cyclical", "Industrials", "Energy",
+                        "Communication Services", "Consumer Defensive"}
+    found_sectors = set(df["sector"].dropna().unique())
+    missing_sectors = expected_sectors - found_sectors
+    check("all major sectors present", len(missing_sectors) == 0,
+          f"missing: {missing_sectors}" if missing_sectors else
+          f"{len(found_sectors)} sectors found")
+
+    # Market cap categories should be populated
+    if "market_cap_category" in df.columns:
+        cats = df["market_cap_category"].value_counts().to_dict()
+        check("market_cap_category populated", len(cats) >= 2, str(cats))
+
+    # Spot check: AAPL should be Technology
+    aapl = df[df["ticker"] == "AAPL"] if "ticker" in df.columns else pd.DataFrame()
+    if not aapl.empty and "sector" in aapl.columns:
+        sector = aapl["sector"].iloc[0]
+        check("AAPL sector = Technology", sector == "Technology",
+              f"actual='{sector}'")
+
+    # Spot check: JPM should be Financial Services
+    jpm = df[df["ticker"] == "JPM"] if "ticker" in df.columns else pd.DataFrame()
+    if not jpm.empty and "sector" in jpm.columns:
+        sector = jpm["sector"].iloc[0]
+        check("JPM sector = Financial Services", sector == "Financial Services",
+              f"actual='{sector}'")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15  Quality metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_quality_metrics() -> None:
+    log.info("\n── 15  Quality Metrics ──────────────────────────────────")
+    df = storage.read_all("quality_metrics")
+
+    if df.empty:
+        log.info("  quality_metrics table empty — running job_quality_metrics() now …")
+        job_quality_metrics()
+        df = storage.read_all("quality_metrics")
+
+    if df.empty:
+        check("quality_metrics loaded", False, "empty after compute"); return
+    check("quality_metrics loaded", True, f"{len(df):,} rows")
+
+    tickers_covered = df["ticker"].nunique()
+    check("quality_metrics covers ≥ 400 tickers", tickers_covered >= 400,
+          f"{tickers_covered} tickers")
+
+    # Should go back at least to 2012 (need prior years for CAGR)
+    df["period_ts"] = pd.to_datetime(df["period_end"], errors="coerce", utc=True)
+    earliest = df["period_ts"].min()
+    check("quality_metrics history starts ≤ 2013",
+          earliest <= pd.Timestamp("2013-01-01", tz="UTC"),
+          f"earliest={earliest.date() if pd.notna(earliest) else 'N/A'}")
+
+    # ROIC sanity: capped at [-100%, 300%] in computation
+    if "roic" in df.columns:
+        roic = pd.to_numeric(df["roic"], errors="coerce").dropna()
+        check("roic has values", len(roic) > 0, f"{len(roic):,} non-null rows")
+        bad_roic = roic[(roic < -1.0) | (roic > 3.0)]
+        check("roic in [-100%, 300%]", len(bad_roic) == 0,
+              f"{len(bad_roic)} outliers" if not bad_roic.empty else
+              f"range [{roic.min():.1%}, {roic.max():.1%}]")
+
+    # Revenue CAGR 3Y: capped at [-80%, 500%] to exclude spin-offs/hypergrowth from near-zero
+    if "revenue_cagr_3y" in df.columns:
+        cagr = pd.to_numeric(df["revenue_cagr_3y"], errors="coerce").dropna()
+        if len(cagr) > 0:
+            bad_cagr = cagr[(cagr < -0.8) | (cagr > 5.0)]
+            check("revenue_cagr_3y in [-80%, 500%]", len(bad_cagr) == 0,
+                  f"{len(bad_cagr)} outliers" if not bad_cagr.empty else
+                  f"range [{cagr.min():.1%}, {cagr.max():.1%}]")
+
+    # Earnings consistency should be in [0, 1]
+    if "earnings_consistency_5y" in df.columns:
+        ec = pd.to_numeric(df["earnings_consistency_5y"], errors="coerce").dropna()
+        bad_ec = ec[(ec < 0) | (ec > 1)]
+        check("earnings_consistency_5y in [0, 1]", len(bad_ec) == 0,
+              f"{len(bad_ec)} out-of-range" if not bad_ec.empty else
+              f"range [{ec.min():.2f}, {ec.max():.2f}]")
+
+    # Buyback yield in reasonable range
+    if "buyback_yield" in df.columns:
+        by = pd.to_numeric(df["buyback_yield"], errors="coerce").dropna()
+        bad_by = by[(by < -0.5) | (by > 0.5)]
+        check("buyback_yield in [-50%, 50%]", len(bad_by) == 0,
+              f"{len(bad_by)} out-of-range" if not bad_by.empty else
+              f"range [{by.min():.1%}, {by.max():.1%}]")
+
+    # Spot check: AAPL ROIC should be very high (>30% historically)
+    aapl = df[df["ticker"] == "AAPL"].copy() if "ticker" in df.columns else pd.DataFrame()
+    if not aapl.empty and "roic" in aapl.columns:
+        roic_vals = pd.to_numeric(aapl["roic"], errors="coerce").dropna()
+        if not roic_vals.empty:
+            median_roic = roic_vals.median()
+            check("AAPL median ROIC > 20%", median_roic > 0.20,
+                  f"median={median_roic:.1%}")
+
+    # Spot check: MSFT revenue CAGR 3Y should be positive
+    msft = df[df["ticker"] == "MSFT"].copy() if "ticker" in df.columns else pd.DataFrame()
+    if not msft.empty and "revenue_cagr_3y" in msft.columns:
+        cagr_vals = pd.to_numeric(msft["revenue_cagr_3y"], errors="coerce").dropna()
+        if not cagr_vals.empty:
+            recent_cagr = cagr_vals.iloc[-1]
+            check("MSFT recent revenue CAGR 3Y > 0", recent_cagr > 0,
+                  f"recent={recent_cagr:.1%}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16  Partition integrity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_partitions() -> None:
-    log.info("\n── 12  Partition file integrity ─────────────────────────")
+    log.info("\n── 16  Partition file integrity ─────────────────────────")
     import pyarrow.parquet as pq
 
     data_root = Path("./data")
@@ -771,6 +1068,10 @@ def main() -> int:
     validate_valuations()
     validate_dividends()
     validate_events_8k()
+    validate_universe_history()
+    validate_short_interest()
+    validate_sectors()
+    validate_quality_metrics()
     validate_partitions()
     validate_incremental_append()
     validate_idempotency()

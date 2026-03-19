@@ -23,3 +23,13 @@ data/
 
 # OS
 .DS_Store
+
+# Runtime artifacts
+daemon.pid
+logs/
+
+# Generated analysis outputs
+*_analysis.json
+*_analysis.csv
+*_holding_periods.csv
+*_quarterly.csv

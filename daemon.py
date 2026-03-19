@@ -15,12 +15,18 @@ Schedule (all times US/Eastern):
   │ indicators         │ Mon-Fri 18:30          │ After OHLCV done   │
   │ earnings           │ Mon-Fri 18:35          │ After market close │
   │ valuations         │ Mon-Fri 18:45          │ After indicators   │
+  │ implied_q4_eps     │ Mon-Fri 18:40          │ After earnings     │
   │ dividends          │ Mon-Fri 19:00          │ After earnings     │
   │ events_8k          │ Mon-Fri 20:30          │ After insider      │
   │ insider_trades     │ Mon-Fri 20:00          │ SEC filing lag     │
   │ macro_fred         │ Daily   07:00          │ FRED publishes AM  │
+  │ short_interest     │ Mon     09:00          │ Weekly snapshot    │
+  │ universe_history   │ Mon     08:30          │ Weekly changes     │
   │ financials         │ Sat     06:00          │ Weekly, low urgency│
+  │ delisted_backfill  │ Sat     07:30          │ After financials   │
+  │ quality_metrics    │ Sat     08:00          │ After financials   │
   │ universe           │ Mon     08:00          │ Weekly refresh     │
+  │ sectors            │ Mon     08:45          │ After universe     │
   └──────────────────────────────────────────────────────────────────┘
 
 Resilience:
@@ -64,7 +70,14 @@ from run_crawler import (
     fetch_financials_edgar,
     fetch_fred_series,
     fetch_insider_trades,
+    fetch_universe_changes,
+    fetch_short_interest_one,
     fetch_full_universe,
+    fetch_sectors,
+    compute_quality_metrics_one,
+    compute_implied_q4_eps_one,
+    fetch_financials_yfinance,
+    NON_EDGAR_TICKERS,
     _market_close_utc,
 )
 
@@ -240,6 +253,35 @@ def job_macro() -> None:
         total += n
         STATE.set_last_fetched("macro", code, now)
 
+    # ── Derive CPI_YOY (true 12-month %) from the full stored CPI_INDEX ──────
+    # Recompute and fully replace every run so the series is always correct.
+    cpi_all = storage.read_all("macro")
+    cpi_all = cpi_all[cpi_all["indicator_code"] == "CPI_INDEX"].copy()
+    if not cpi_all.empty:
+        cpi_all["event_ts"] = pd.to_datetime(cpi_all["event_timestamp"], format="ISO8601", errors="coerce")
+        cpi_all = (cpi_all.sort_values("event_ts")
+                          .drop_duplicates("event_ts", keep="last")
+                          .reset_index(drop=True))
+        cpi_all["value_12m"] = cpi_all["value"].shift(12)
+        cpi_yoy_df = cpi_all.dropna(subset=["value_12m"]).copy()
+        cpi_yoy_df["value"] = ((cpi_yoy_df["value"] - cpi_yoy_df["value_12m"])
+                               / cpi_yoy_df["value_12m"] * 100).round(4)
+        cpi_yoy_df["indicator_code"] = "CPI_YOY"
+        cpi_yoy_df["series_id"]      = "CPIAUCSL_YOY"
+        today_date = pd.Timestamp.today().normalize().date()
+        cpi_yoy_df["knowledge_timestamp"] = cpi_yoy_df["event_ts"].apply(
+            lambda t: str(min((t + pd.Timedelta(days=45)).date(), today_date))
+        )
+        cpi_yoy_df = cpi_yoy_df.drop(columns=["event_ts", "value_12m"])
+        # Always replace CPI_YOY partition to prevent stale rows accumulating
+        import shutil as _shutil
+        cpi_yoy_dir = storage.DATA_ROOT / "macro" / "indicator_code=CPI_YOY"
+        if cpi_yoy_dir.exists():
+            _shutil.rmtree(cpi_yoy_dir)
+        n_yoy = storage.append("macro", cpi_yoy_df)
+        total += n_yoy
+        log.info("  CPI_YOY derived: %d rows (12-month YoY %%)", n_yoy)
+
     _log_job("macro_fred", total)
 
 
@@ -287,7 +329,6 @@ def job_earnings() -> None:
     log.info("── JOB: earnings ─────────────────────────────────────")
     total = 0
     now = datetime.now(UTC)
-    loop = asyncio.new_event_loop()
 
     tickers = _get_tickers()
     log.info("  Processing %d tickers (EDGAR + yfinance)", len(tickers))
@@ -303,6 +344,50 @@ def job_earnings() -> None:
             log.error("  earnings %s FAILED: %s", ticker, exc)
 
     _log_job("earnings", total)
+
+
+# ── Job: Implied Q4 EPS ───────────────────────────────────────────────────────
+
+def job_implied_q4_eps() -> None:
+    """
+    Derive implied Q4 EPS = annual_EPS − (Q1 + Q2 + Q3) for every ticker
+    and store as synthetic 10-Q rows so the TTM P/E rolling window is complete.
+
+    Companies don't file a 10-Q for fiscal Q4 — only a 10-K.  Without this
+    fix, the rolling-4-quarter TTM P/E systematically overstates P/E by 10-15%
+    during the gap between the annual filing and the next Q1 filing.
+
+    Runs Mon-Fri 18:40 — right after job_earnings completes.
+    """
+    log.info("── JOB: implied_q4_eps ───────────────────────────────")
+    total = 0
+    now   = datetime.now(UTC)
+
+    earn_all = storage.read_all("earnings")
+    if earn_all.empty:
+        log.warning("  implied_q4_eps: earnings table empty — skipping")
+        return
+
+    tickers = list(set(_get_tickers()) |
+                   set(earn_all["ticker"].unique() if not earn_all.empty else []))
+    log.info("  Computing implied Q4 for %d tickers", len(tickers))
+
+    for ticker in tickers:
+        try:
+            df = compute_implied_q4_eps_one(
+                ticker,
+                earn_all[earn_all["ticker"] == ticker],
+            )
+            if df.empty:
+                continue
+            n = storage.append("earnings", df)
+            total += n
+            if n:
+                log.debug("  implied_q4 %-6s +%d", ticker, n)
+        except Exception as exc:
+            log.error("  implied_q4 %s FAILED: %s", ticker, exc)
+
+    _log_job("implied_q4_eps", total)
 
 
 # ── Job: Valuation ratios ─────────────────────────────────────────────────────
@@ -398,7 +483,19 @@ def job_financials() -> None:
     log.info("  Processing %d tickers (SEC EDGAR XBRL)", len(tickers))
     for ticker in tickers:
         try:
-            df = fetch_financials_edgar(ticker)
+            # Primary: SEC EDGAR XBRL for US filers
+            if ticker not in NON_EDGAR_TICKERS:
+                df = fetch_financials_edgar(ticker)
+            else:
+                df = pd.DataFrame()
+
+            # Fallback: yfinance for non-EDGAR filers (foreign companies)
+            # Also use as supplement if EDGAR returned nothing
+            if df.empty:
+                df = fetch_financials_yfinance(ticker)
+                if not df.empty:
+                    log.debug("  financials %-6s using yfinance fallback", ticker)
+
             if df.empty:
                 continue
             n = storage.append("financials", df)
@@ -470,6 +567,201 @@ def job_universe() -> None:
         _log_job("universe", n)
     except Exception as exc:
         log.error("  universe FAILED: %s", exc)
+
+
+# ── Job: Universe membership history ─────────────────────────────────────────
+
+def job_universe_history() -> None:
+    """
+    Fetch S&P 500 and NASDAQ 100 membership changes from Wikipedia.
+    Stores every addition and removal event with date and reason.
+    Runs weekly (Monday 08:30) just after the universe refresh.
+    """
+    log.info("── JOB: universe_history ─────────────────────────────")
+    try:
+        df = fetch_universe_changes()
+        if df.empty:
+            log.warning("  universe_history: no data returned")
+            return
+        n = storage.append("universe_history", df)
+        added   = (df["action"] == "added").sum()
+        removed = (df["action"] == "removed").sum()
+        log.info("  universe_history: %d added events, %d removed events stored",
+                 added, removed)
+        STATE.set_last_fetched("universe_history")
+        _log_job("universe_history", n)
+    except Exception as exc:
+        log.error("  universe_history FAILED: %s", exc)
+
+
+# ── Job: Short interest snapshots ─────────────────────────────────────────────
+
+def job_short_interest() -> None:
+    """
+    Fetch current + prior-month short interest for every ticker via yfinance.
+    Running weekly builds a time series going forward.
+
+    Note: FINRA consolidated CDN returns HTTP 403; yfinance is the free
+    substitute providing settlement-date short interest and prior month data.
+    """
+    log.info("── JOB: short_interest ───────────────────────────────")
+    total = 0
+    now   = datetime.now(UTC)
+
+    tickers = _get_tickers()
+    log.info("  Fetching short interest for %d tickers", len(tickers))
+
+    for ticker in tickers:
+        try:
+            df = fetch_short_interest_one(ticker)
+            if df.empty:
+                continue
+            n = storage.append("short_interest", df)
+            total += n
+            STATE.set_last_fetched("short_interest", ticker, now)
+            time.sleep(0.25)
+        except Exception as exc:
+            log.error("  short_interest %s FAILED: %s", ticker, exc)
+
+    _log_job("short_interest", total)
+
+
+# ── Job: Delisted ticker data backfill ────────────────────────────────────────
+
+def job_delisted_backfill() -> None:
+    """
+    Fetch OHLCV, earnings, and financials for tickers that were historically
+    in the S&P 500 or NASDAQ 100 but have since been removed (acquired, merged,
+    delisted, or dropped for underperformance).
+
+    Adds negative/different examples to training data, partially correcting the
+    survivorship bias inherent in using only the current index membership.
+
+    Incremental: state checkpoint tracks which tickers have been processed.
+    Processes up to 50 new tickers per run (runs Saturdays 07:30).
+    Data is stored in the existing ohlcv/earnings/financials tables — same schema.
+    """
+    log.info("── JOB: delisted_backfill ────────────────────────────")
+
+    hist = storage.read_all("universe_history")
+    if hist.empty:
+        log.info("  universe_history empty — run job_universe_history first")
+        return
+
+    removed_tickers  = set(hist[hist["action"] == "removed"]["ticker"].unique())
+    current_tickers  = set(_get_tickers())
+    epoch = datetime(2010, 1, 1, tzinfo=UTC)
+
+    # Only process tickers that are removed AND not in the current live universe
+    # AND not already checkpointed (i.e. not yet fetched)
+    candidates = sorted(
+        t for t in removed_tickers - current_tickers
+        if STATE.get_last_fetched("delisted_backfill", t) <= epoch
+    )
+
+    if not candidates:
+        log.info("  All %d removed tickers already backfilled", len(removed_tickers - current_tickers))
+        return
+
+    batch = candidates[:50]
+    log.info("  Backfilling %d delisted tickers (%d remaining after this run)",
+             len(batch), len(candidates) - len(batch))
+
+    total_ohlcv = total_earn = total_fin = 0
+    for ticker in batch:
+        try:
+            df_ohlcv = fetch_ohlcv_one(ticker)
+            if not df_ohlcv.empty:
+                total_ohlcv += storage.append("ohlcv", df_ohlcv)
+
+            df_earn = fetch_earnings_one(ticker)
+            if not df_earn.empty:
+                total_earn += storage.append("earnings", df_earn)
+
+            df_fin = fetch_financials_edgar(ticker)
+            if not df_fin.empty:
+                total_fin += storage.append("financials", df_fin)
+
+            STATE.set_last_fetched("delisted_backfill", ticker)
+            log.debug("  delisted %-6s  ohlcv=%d earn=%d fin=%d",
+                      ticker, total_ohlcv, total_earn, total_fin)
+            time.sleep(0.5)   # be courteous to yfinance + EDGAR
+        except Exception as exc:
+            log.error("  delisted_backfill %s FAILED: %s", ticker, exc)
+
+    log.info("  delisted_backfill done: +%d ohlcv  +%d earnings  +%d financials",
+             total_ohlcv, total_earn, total_fin)
+
+
+# ── Job: Sector / industry classification ─────────────────────────────────────
+
+def job_sectors() -> None:
+    """
+    Fetch sector, industry, and market-cap category for all tickers via yfinance.
+    Stores a single flat file (sectors_latest.parquet) — refreshed weekly.
+    Sectors rarely change, so weekly is more than sufficient.
+    """
+    log.info("── JOB: sectors ──────────────────────────────────────")
+    try:
+        tickers = _get_tickers()
+        log.info("  Fetching sector classification for %d tickers", len(tickers))
+        df = fetch_sectors(tickers)
+        if df.empty:
+            log.warning("  sectors: no data returned")
+            return
+        n = storage.append("sectors", df)
+        log.info("  sectors: %d tickers stored", df["ticker"].nunique())
+        STATE.set_last_fetched("sectors")
+        _log_job("sectors", n)
+    except Exception as exc:
+        log.error("  sectors FAILED: %s", exc)
+
+
+# ── Job: Quality metrics ───────────────────────────────────────────────────────
+
+def job_quality_metrics() -> None:
+    """
+    Compute fundamental quality metrics (ROIC, FCF yield, revenue CAGR, etc.)
+    for every ticker from existing financials + OHLCV data.
+    Pure in-memory computation — no external API calls.
+    Runs Saturday 08:00, after financials and delisted_backfill.
+    """
+    log.info("── JOB: quality_metrics ──────────────────────────────")
+    total = 0
+    now   = datetime.now(UTC)
+
+    fin_all   = storage.read_all("financials")
+    ohlcv_all = storage.read_all("ohlcv")
+
+    if fin_all.empty:
+        log.warning("  quality_metrics: financials table empty — skipping")
+        return
+
+    tickers = _get_tickers()
+    # Also include delisted tickers that have financials
+    if not fin_all.empty:
+        all_fin_tickers = set(fin_all["ticker"].unique())
+        tickers = list(set(tickers) | all_fin_tickers)
+    log.info("  Computing quality metrics for %d tickers", len(tickers))
+
+    for ticker in tickers:
+        try:
+            df = compute_quality_metrics_one(
+                ticker,
+                fin_all[fin_all["ticker"] == ticker],
+                ohlcv_all[ohlcv_all["ticker"] == ticker] if not ohlcv_all.empty else pd.DataFrame(),
+            )
+            if df.empty:
+                continue
+            n = storage.append("quality_metrics", df)
+            total += n
+            if n:
+                log.debug("  quality_metrics %-6s +%d", ticker, n)
+            STATE.set_last_fetched("quality_metrics", ticker, now)
+        except Exception as exc:
+            log.error("  quality_metrics %s FAILED: %s", ticker, exc)
+
+    _log_job("quality_metrics", total)
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
@@ -558,6 +850,10 @@ def build_scheduler() -> BlockingScheduler:
                       hour=18, minute=35, id="earnings",
                       max_instances=1, misfire_grace_time=3600)
 
+    scheduler.add_job(job_implied_q4_eps, "cron", day_of_week="mon-fri",
+                      hour=18, minute=40, id="implied_q4_eps",
+                      max_instances=1, misfire_grace_time=3600)
+
     scheduler.add_job(job_insider,    "cron", day_of_week="mon-fri",
                       hour=20, minute=0,  id="insider_trades",
                       max_instances=1, misfire_grace_time=3600)
@@ -577,8 +873,29 @@ def build_scheduler() -> BlockingScheduler:
                       max_instances=1, misfire_grace_time=7200)
 
     # ── Universe: every Monday morning ───────────────────────────────────────
-    scheduler.add_job(job_universe,   "cron", day_of_week="mon",
+    scheduler.add_job(job_universe,         "cron", day_of_week="mon",
                       hour=8, minute=0,  id="universe",
+                      max_instances=1, misfire_grace_time=7200)
+
+    scheduler.add_job(job_universe_history, "cron", day_of_week="mon",
+                      hour=8, minute=30, id="universe_history",
+                      max_instances=1, misfire_grace_time=7200)
+
+    scheduler.add_job(job_short_interest,   "cron", day_of_week="mon",
+                      hour=9, minute=0,  id="short_interest",
+                      max_instances=1, misfire_grace_time=7200)
+
+    # ── Delisted backfill: every Saturday (50 tickers per run) ───────────────
+    scheduler.add_job(job_delisted_backfill,"cron", day_of_week="sat",
+                      hour=7, minute=30, id="delisted_backfill",
+                      max_instances=1, misfire_grace_time=7200)
+
+    scheduler.add_job(job_quality_metrics,  "cron", day_of_week="sat",
+                      hour=8, minute=0,  id="quality_metrics",
+                      max_instances=1, misfire_grace_time=7200)
+
+    scheduler.add_job(job_sectors,          "cron", day_of_week="mon",
+                      hour=8, minute=45, id="sectors",
                       max_instances=1, misfire_grace_time=7200)
 
     # ── Heartbeat: every hour ────────────────────────────────────────────────
@@ -588,11 +905,33 @@ def build_scheduler() -> BlockingScheduler:
 
 
 def run_all_once() -> None:
-    """Run every job immediately in sequence (for --once mode)."""
+    """Run every job immediately in sequence (for --once mode).
+
+    Dependency order matters for correctness on first/reset runs:
+      universe         → provides ticker list for all subsequent jobs
+      ohlcv            → price data required by indicators, valuations, dividends
+      financials       → balance sheet/CF required by valuations, quality_metrics
+      earnings         → EPS required by valuations, dividends, implied_q4
+      implied_q4_eps   → must run after earnings (derives from earnings table)
+      indicators       → requires ohlcv
+      valuations       → requires ohlcv + earnings + financials
+      dividends        → requires ohlcv + earnings
+      quality_metrics  → requires financials (+ ohlcv for market-cap lookup)
+    """
     log.info("Running all jobs once …")
-    for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
-               job_dividends, job_macro, job_earnings, job_financials,
-               job_events_8k, job_insider):
+    for fn in (job_universe, job_universe_history, job_short_interest,
+               job_ohlcv,
+               job_financials,         # before valuations / quality_metrics
+               job_earnings,           # before implied_q4, valuations, dividends
+               job_implied_q4_eps,     # after earnings
+               job_macro,
+               job_indicators,         # after ohlcv
+               job_valuations,         # after ohlcv + earnings + financials
+               job_dividends,          # after ohlcv + earnings
+               job_events_8k, job_insider,
+               job_delisted_backfill,  # fills ohlcv/earnings/financials for removed tickers
+               job_quality_metrics,    # after financials
+               job_sectors):
         try:
             fn()
         except Exception as exc:
@@ -628,11 +967,22 @@ def main() -> None:
              else 0, LOG_DIR / "daemon.log")
     log.info("=" * 60)
 
-    # Run all jobs immediately on startup to catch up on any missed data
+    # Run all jobs immediately on startup to catch up on any missed data.
+    # Order matters: dependencies must complete before derived jobs run.
     log.info("Initial catch-up run …")
-    for fn in (job_universe, job_ohlcv, job_indicators, job_valuations,
-               job_dividends, job_macro, job_earnings, job_financials,
-               job_events_8k, job_insider):
+    for fn in (job_universe, job_universe_history, job_short_interest,
+               job_ohlcv,
+               job_financials,         # before valuations / quality_metrics
+               job_earnings,           # before implied_q4, valuations, dividends
+               job_implied_q4_eps,     # after earnings
+               job_macro,
+               job_indicators,         # after ohlcv
+               job_valuations,         # after ohlcv + earnings + financials
+               job_dividends,          # after ohlcv + earnings
+               job_events_8k, job_insider,
+               job_delisted_backfill,  # fills ohlcv/earnings/financials for removed tickers
+               job_quality_metrics,    # after financials
+               job_sectors):
         try:
             fn()
         except Exception as exc:

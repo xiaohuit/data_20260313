@@ -40,7 +40,9 @@ log = logging.getLogger(__name__)
 
 UTC = timezone.utc
 DATA_DIR = Path("./data")
-END   = datetime.now(UTC)
+# NOTE: Do NOT use a module-level END constant — it would freeze at import time
+# and cause OHLCV/FRED fetches to stop at daemon start rather than "now".
+# Each fetch function computes its own end date at call time.
 
 # OHLCV/indicators/earnings: 15 years of daily bars gives models enough
 # data to learn across multiple market cycles (2008 recovery, 2020 crash, etc.)
@@ -83,13 +85,33 @@ _EDGAR_HEADERS = {
 
 FRED_SERIES = {
     "FED_FUNDS_RATE": "FEDFUNDS",
-    "CPI_YOY":        "CPIAUCSL",
+    "CPI_INDEX":      "CPIAUCSL",   # raw CPI index level; CPI_YOY (%) is derived below
     "GDP_GROWTH":     "A191RL1Q225SBEA",
     "UNEMPLOYMENT":   "UNRATE",
     "10Y_YIELD":      "GS10",
+    "2Y_YIELD":       "GS2",        # short-end yields; enables independent 2Y signal
     "VIX":            "VIXCLS",
     "YIELD_CURVE":    "T10Y2Y",
     "CONSUMER_CONF":  "UMCSENT",
+    "M2":             "M2SL",       # M2 money supply — liquidity/QE regime indicator
+    "OIL_WTI":        "DCOILWTICO", # WTI crude oil price — energy costs, inflation signal
+}
+
+# Publication lag per series (days after reference period before data is publicly released).
+# Used to set knowledge_timestamp correctly when no FRED API key is available.
+# Daily market series are available same/next day; monthly macro series lag 30–45 days.
+_FRED_PUB_LAG = {
+    "VIX":            1,    # VIX is a real-time market index
+    "YIELD_CURVE":    1,    # T10Y2Y updated daily
+    "10Y_YIELD":      1,    # GS10 updated daily
+    "2Y_YIELD":       1,    # GS2 updated daily (Fed H.15 release)
+    "OIL_WTI":        2,    # EIA publishes DCOILWTICO daily with ~1-2 day lag
+    "FED_FUNDS_RATE": 35,   # FEDFUNDS: effective rate published ~35 days after month end
+    "CPI_INDEX":      45,   # CPI released ~45 days after reference month end
+    "UNEMPLOYMENT":   35,   # BLS Employment Situation: first Friday of following month
+    "GDP_GROWTH":     90,   # BEA advance GDP estimate: ~30 days; use 90 for revision
+    "CONSUMER_CONF":  35,   # UMich consumer sentiment: ~35 days
+    "M2":             45,   # M2: published ~5 weeks after reference month end
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,10 +246,11 @@ def _market_close_utc(ts: pd.Timestamp) -> str:
 
 
 def fetch_ohlcv_one(ticker: str) -> pd.DataFrame:
+    end = datetime.now(UTC)
     t = yf.Ticker(ticker)
     df = t.history(
         start=START_EQUITY.strftime("%Y-%m-%d"),
-        end=END.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
         interval="1d",
         auto_adjust=False,
         back_adjust=False,
@@ -252,7 +275,7 @@ def fetch_ohlcv_one(ticker: str) -> pd.DataFrame:
 
 async def fetch_all_ohlcv(tickers: list[str]) -> pd.DataFrame:
     log.info("📈  Downloading OHLCV for %d tickers (%s → %s) …",
-             len(tickers), START_EQUITY.date(), END.date())
+             len(tickers), START_EQUITY.date(), datetime.now(UTC).date())
     loop = asyncio.get_running_loop()
     frames = []
     for i, ticker in enumerate(tickers, 1):
@@ -332,11 +355,11 @@ def compute_valuations_one(
     is used — no look-ahead bias.
 
     Ratios computed:
-      pe_ttm       — Price / Trailing-12-month EPS (last 4 quarterly reports)
+      pe_ttm       — Price / Trailing-12-month EPS (last 4 quarterly reports, implied Q4)
       pb           — Price / Book value per share
-      ps           — Price / Annual revenue per share  (last 10-K)
-      ev_ebitda    — Enterprise value / EBITDA          (last 10-K)
-      fcf_yield    — Free cash flow per share / Price   (last 10-K)
+      ps           — Price / TTM revenue per share  (4Q rolling with implied Q4; annual fallback)
+      ev_ebitda    — Enterprise value / EBITDA          (last 10-K, annual convention)
+      fcf_yield    — TTM FCF per share / Price   (4Q rolling with implied Q4; annual fallback)
       dividend_yield — Trailing-12-month dividends / Price
     """
     if ohlcv_sub.empty:
@@ -353,12 +376,21 @@ def compute_valuations_one(
     price["div_ttm"] = price["dividends"].fillna(0).rolling(252, min_periods=1).sum()
 
     # ── 2. TTM EPS — rolling sum of last 4 quarterly EPS reports ─────────────
-    earn_q = earn_sub[earn_sub["form"] == "10-Q"].copy()
+    # Guard: non-EDGAR tickers (ASML, ARM, etc.) have no "form" column when
+    # fetch_earnings_one fell back to yfinance-only data.  Use all rows as
+    # quarterly proxies in that case (yfinance earnings_history is quarterly).
+    earn_q = (earn_sub[earn_sub["form"] == "10-Q"].copy()
+              if "form" in earn_sub.columns else earn_sub.copy())
     ttm_eps_lkp = pd.DataFrame(columns=["kt", "ttm_eps"])
     if not earn_q.empty and "epsactual" in earn_q.columns:
         earn_q["kt"] = pd.to_datetime(earn_q["knowledge_timestamp"], utc=True)
+        # Force numeric: guards against "None"/"nan" strings written by _merge in
+        # older pipeline versions or after concat of mixed-type parquet partitions.
+        earn_q["epsactual"] = pd.to_numeric(earn_q["epsactual"], errors="coerce")
         earn_q = earn_q.sort_values("kt").dropna(subset=["epsactual"])
-        earn_q["ttm_eps"] = earn_q["epsactual"].rolling(4, min_periods=2).sum()
+        # min_periods=4 ensures we only report TTM when all 4 quarters are known —
+        # fewer quarters underestimate TTM EPS and inflate P/E by up to 2–3×.
+        earn_q["ttm_eps"] = earn_q["epsactual"].rolling(4, min_periods=4).sum()
         ttm_eps_lkp = earn_q[["kt", "ttm_eps"]].dropna().drop_duplicates("kt")
 
     # ── 3. Balance sheet: most recent filing of any type, PiT ────────────────
@@ -370,14 +402,31 @@ def compute_valuations_one(
         fin_bs = fin_bs.sort_values("kt").drop_duplicates("kt", keep="last")
         bs_lkp = fin_bs[["kt"] + [c for c in bs_cols if c in fin_bs.columns]]
 
-    # ── 4. Annual flow metrics: most recent 10-K, PiT ────────────────────────
-    flow_cols = ["revenue", "operating_income", "depreciation_amortization", "fcf"]
-    fin_annual = fin_sub[fin_sub["form"] == "10-K"].copy() if not fin_sub.empty else pd.DataFrame()
-    flow_lkp = pd.DataFrame(columns=["kt"] + flow_cols)
+    # ── 4a. TTM flow metrics: rolling 4-quarter sum with implied Q4 ───────────
+    # P/S and FCF yield use TTM (4-quarter sum) rather than the last 10-K annual
+    # figure, which can be 6-11 months stale mid-fiscal-year.
+    #
+    # Naive rolling(4) over 10-Q rows only is WRONG: companies file 3 10-Qs per
+    # year (Q1/Q2/Q3); the 4th slot would be Q3 of the prior fiscal year instead
+    # of Q4 of the prior fiscal year.  _ttm_flow_series() computes an implied
+    # Q4 = annual_10K − Q1 − Q2 − Q3 (same pattern as implied Q4 EPS) so the
+    # rolling window is always 4 true consecutive fiscal quarters.
+    ttm_rev_lkp = _ttm_flow_series(fin_sub, "revenue")
+    ttm_fcf_lkp = _ttm_flow_series(fin_sub, "fcf")
+
+    # ── 4b. Annual flow metrics: most recent 10-K, PiT ───────────────────────
+    # Keep operating_income and D&A from annual 10-K for EV/EBITDA — this ratio
+    # is conventionally computed on a trailing-twelve-month or annual basis and
+    # using it from the most recent annual filing is industry standard.
+    ann_flow_cols = ["revenue", "operating_income", "depreciation_amortization", "fcf"]
+    fin_annual = (fin_sub[fin_sub["form"] == "10-K"].copy()
+                  if (not fin_sub.empty and "form" in fin_sub.columns)
+                  else pd.DataFrame())
+    flow_lkp = pd.DataFrame(columns=["kt"] + ann_flow_cols)
     if not fin_annual.empty:
         fin_annual["kt"] = pd.to_datetime(fin_annual["knowledge_timestamp"], utc=True)
         fin_annual = fin_annual.sort_values("kt").drop_duplicates("kt", keep="last")
-        flow_lkp = fin_annual[["kt"] + [c for c in flow_cols if c in fin_annual.columns]]
+        flow_lkp = fin_annual[["kt"] + [c for c in ann_flow_cols if c in fin_annual.columns]]
 
     # ── 5. PiT joins via merge_asof ───────────────────────────────────────────
     base = price.copy()
@@ -399,8 +448,23 @@ def compute_valuations_one(
         base = pd.merge_asof(base, flow_lkp, left_on="date", right_on="kt",
                              direction="backward").drop(columns=["kt"], errors="ignore")
     else:
-        for c in flow_cols:
+        for c in ann_flow_cols:
             base[c] = None
+
+    # Merge TTM revenue (preferred for P/S) — falls back to annual revenue if
+    # < 4 quarterly filings are available (non-EDGAR tickers, early history).
+    if not ttm_rev_lkp.empty:
+        base = pd.merge_asof(base, ttm_rev_lkp, left_on="date", right_on="kt",
+                             direction="backward").drop(columns=["kt"], errors="ignore")
+    else:
+        base["ttm_revenue"] = None
+
+    # Merge TTM FCF (preferred for FCF yield).
+    if not ttm_fcf_lkp.empty:
+        base = pd.merge_asof(base, ttm_fcf_lkp, left_on="date", right_on="kt",
+                             direction="backward").drop(columns=["kt"], errors="ignore")
+    else:
+        base["ttm_fcf"] = None
 
     # ── 6. Derived metrics ────────────────────────────────────────────────────
     def _col(name: str) -> pd.Series:
@@ -427,8 +491,21 @@ def compute_valuations_one(
 
     base["market_cap"]           = close * shares
     base["book_value_per_share"] = _sdiv(_col("total_equity"), shares)
-    base["revenue_per_share"]    = _sdiv(_col("revenue"),      shares)
-    base["fcf_per_share"]        = _sdiv(_col("fcf"),          shares)
+
+    # P/S: prefer TTM revenue (4-quarter rolling sum) over annual 10-K revenue.
+    # Fall back to annual if TTM is not available (< 4 quarters of history or
+    # non-EDGAR tickers that only report annual data).
+    ttm_rev  = _col("ttm_revenue")
+    ann_rev  = _col("revenue")
+    eff_rev  = ttm_rev.where(ttm_rev.notna(), ann_rev)   # TTM preferred, annual fallback
+    base["revenue_per_share"]    = _sdiv(eff_rev,          shares)
+
+    # FCF per share: prefer TTM FCF over annual 10-K FCF.
+    ttm_fcf_s = _col("ttm_fcf")
+    ann_fcf   = _col("fcf")
+    eff_fcf   = ttm_fcf_s.where(ttm_fcf_s.notna(), ann_fcf)
+    base["fcf_per_share"]        = _sdiv(eff_fcf,          shares)
+
     lt_debt = _col("lt_debt").fillna(0)
     cash    = _col("cash").fillna(0)
     base["enterprise_value"]     = base["market_cap"] + lt_debt - cash
@@ -437,14 +514,14 @@ def compute_valuations_one(
     base["pe_ttm"]  = _sdiv(close, _col("ttm_eps"),               lo=0,   hi=500)
     # P/B
     base["pb"]      = _sdiv(close, _col("book_value_per_share"),   lo=0,   hi=100)
-    # P/S
+    # P/S (uses TTM or annual revenue per share)
     base["ps"]      = _sdiv(close, _col("revenue_per_share"),      lo=0,   hi=200)
-    # EV/EBITDA
+    # EV/EBITDA: uses annual operating_income + D&A (industry convention)
     ebitda = _col("operating_income").fillna(0) + _col("depreciation_amortization").fillna(0)
     ebitda[ebitda <= 0] = float("nan")
     base["ebitda"]    = ebitda
     base["ev_ebitda"] = _sdiv(_col("enterprise_value"), ebitda,    lo=0,   hi=300)
-    # FCF yield
+    # FCF yield (uses TTM or annual FCF per share)
     base["fcf_yield"]      = _sdiv(_col("fcf_per_share"), close,   lo=-0.5, hi=0.5)
     # Dividend yield
     base["dividend_yield"] = _sdiv(_col("div_ttm"), close,         lo=0,   hi=0.5)
@@ -452,14 +529,17 @@ def compute_valuations_one(
     # ── 7. Final output ───────────────────────────────────────────────────────
     base["ticker"]               = ticker
     base["event_timestamp"]      = base["date"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    base["knowledge_timestamp"]  = base["date"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    # knowledge_timestamp = market close (when close price becomes observable).
+    # Using midnight UTC would introduce look-ahead if a consumer filters by
+    # exact UTC time — consistent with OHLCV and indicators which use _market_close_utc.
+    base["knowledge_timestamp"]  = base["date"].apply(_market_close_utc)
     base["source"]               = "computed"
 
     out_cols = [
         "ticker", "event_timestamp", "knowledge_timestamp", "source",
         "close", "market_cap", "enterprise_value", "shares_outstanding",
         "ttm_eps", "book_value_per_share", "revenue_per_share", "fcf_per_share",
-        "revenue", "fcf", "ebitda",
+        "revenue", "ttm_revenue", "fcf", "ttm_fcf", "ebitda",
         "pe_ttm", "pb", "ps", "ev_ebitda", "fcf_yield", "dividend_yield",
     ]
     out = base[[c for c in out_cols if c in base.columns]].copy()
@@ -495,7 +575,211 @@ def compute_all_valuations(tickers: list[str],
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4b. Dividend history (derived — computed from OHLCV dividends + earnings EPS)
+# 4b. Universe membership changes (S&P 500 + NASDAQ 100 — Wikipedia)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_universe_changes() -> pd.DataFrame:
+    """
+    Fetch historical S&P 500 and NASDAQ 100 membership changes from Wikipedia.
+
+    Returns one row per event (addition and removal are separate rows), covering
+    the full available Wikipedia history — typically back to ~2000 for S&P 500
+    and several years for NASDAQ 100.
+
+    Schema: ticker, company, index_name, action ("added"/"removed"),
+            event_date, event_timestamp, knowledge_timestamp, reason, source
+
+    Used for:
+      1. PiT-correct universe reconstruction — what stocks were in the index
+         on any given date for backtesting.
+      2. Delisted/removed ticker discovery — survivorship bias correction.
+    """
+    sources = [
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500"),
+        ("https://en.wikipedia.org/wiki/Nasdaq-100",                   "NASDAQ 100"),
+    ]
+    records = []
+    _EMPTY = {"", "—", "–", "N/A", "n/a", "None", "none"}
+
+    for url, index_name in sources:
+        try:
+            resp = requests.get(url, headers=_WIKI_HEADERS, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table", {"id": "changes"})
+            if not table:
+                # Fallback: Wikipedia occasionally renames the table ID.
+                # Try finding any wikitable whose preceding header mentions "changes".
+                for hdr in soup.find_all(["h2", "h3"]):
+                    if "change" in hdr.get_text(strip=True).lower():
+                        table = hdr.find_next("table", class_="wikitable")
+                        if table:
+                            break
+            if not table:
+                log.warning("  No #changes table found for %s — skipping", index_name)
+                continue
+
+            # Use <tbody> rows only — skips the two-level <thead>
+            tbody = table.find("tbody") or table
+            rows  = tbody.find_all("tr")
+
+            for row in rows:
+                cells = [c.get_text(separator=" ", strip=True)
+                         for c in row.find_all("td")]
+                if len(cells) < 4:
+                    continue
+
+                # Col layout: 0=date, 1=add_ticker, 2=add_company,
+                #             3=rem_ticker, 4=rem_company, 5=reason
+                date_text   = cells[0]
+                event_date  = pd.to_datetime(date_text, errors="coerce")
+                if pd.isna(event_date):
+                    continue
+                event_date_str = event_date.date().isoformat()
+                ts = f"{event_date_str}T00:00:00+00:00"
+
+                add_ticker  = cells[1].replace(".", "-").strip() if len(cells) > 1 else ""
+                add_company = cells[2].strip()                   if len(cells) > 2 else ""
+                rem_ticker  = cells[3].replace(".", "-").strip() if len(cells) > 3 else ""
+                rem_company = cells[4].strip()                   if len(cells) > 4 else ""
+                reason      = cells[5].strip()                   if len(cells) > 5 else ""
+
+                if add_ticker and add_ticker not in _EMPTY:
+                    records.append({
+                        "ticker":              add_ticker,
+                        "company":             add_company,
+                        "index_name":          index_name,
+                        "action":              "added",
+                        "event_date":          event_date_str,
+                        "event_timestamp":     ts,
+                        "knowledge_timestamp": ts,
+                        "reason":              reason,
+                        "source":              "Wikipedia",
+                    })
+
+                if rem_ticker and rem_ticker not in _EMPTY:
+                    records.append({
+                        "ticker":              rem_ticker,
+                        "company":             rem_company,
+                        "index_name":          index_name,
+                        "action":              "removed",
+                        "event_date":          event_date_str,
+                        "event_timestamp":     ts,
+                        "knowledge_timestamp": ts,
+                        "reason":              reason,
+                        "source":              "Wikipedia",
+                    })
+
+        except Exception as exc:
+            log.warning("  Universe changes %s failed: %s", index_name, exc)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = (pd.DataFrame(records)
+            .sort_values("event_date")
+            .drop_duplicates(subset=["ticker", "index_name", "action", "event_date"],
+                             keep="last")
+            .reset_index(drop=True))
+    log.info("    → %d membership events  (added=%d  removed=%d)",
+             len(df),
+             (df["action"] == "added").sum(),
+             (df["action"] == "removed").sum())
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4c. Short interest (yfinance — current + prior-month snapshots)
+#
+# Note: FINRA's consolidated short interest CDN is access-restricted (HTTP 403).
+# yfinance provides current settlement date + prior month in Ticker.info,
+# giving two data points per fetch.  Running weekly builds a time series.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_short_interest_one(ticker: str) -> pd.DataFrame:
+    """
+    Fetch current and prior-month short interest for one ticker via yfinance.
+
+    Returns 1–2 rows:
+      - current  : settlement_date from dateShortInterest, with days_to_cover
+                   and short_pct_float
+      - prior    : settlement_date from sharesShortPreviousMonthDate, shares only
+
+    Columns: ticker, settlement_date, event_timestamp, knowledge_timestamp,
+             shares_short, days_to_cover, short_pct_float, float_shares, source
+    """
+    records: list[dict] = []
+    try:
+        info = yf.Ticker(ticker).info
+        # PiT: FINRA publishes short interest ~2-3 weeks after the settlement date.
+        # yfinance serves the data only AFTER publication, so knowledge_timestamp
+        # = now (fetch time) is correct.  Using settlement_date as knowledge_timestamp
+        # would introduce a ~14-21 day look-ahead bias in backtests.
+        fetch_kt = datetime.now(UTC).isoformat()
+
+        shares_short    = info.get("sharesShort")
+        short_date_ts   = info.get("dateShortInterest")
+        short_ratio     = info.get("shortRatio")
+        short_pct_float = info.get("shortPercentOfFloat")
+        float_shares    = info.get("floatShares")
+
+        if shares_short and short_date_ts:
+            settle = pd.to_datetime(short_date_ts, unit="s").date()
+            ts = f"{settle.isoformat()}T00:00:00+00:00"
+            records.append({
+                "ticker":              ticker,
+                "settlement_date":     settle.isoformat(),
+                "event_timestamp":     ts,
+                "knowledge_timestamp": fetch_kt,   # known when yfinance published it
+                "shares_short":        int(shares_short),
+                "days_to_cover":       float(short_ratio)     if short_ratio     else None,
+                "short_pct_float":     float(short_pct_float) if short_pct_float else None,
+                "float_shares":        int(float_shares)      if float_shares    else None,
+                "source":              "yfinance",
+            })
+
+        prior_shares  = info.get("sharesShortPriorMonth")
+        prior_date_ts = info.get("sharesShortPreviousMonthDate")
+        if prior_shares and prior_date_ts:
+            prior_settle = pd.to_datetime(prior_date_ts, unit="s").date()
+            pts = f"{prior_settle.isoformat()}T00:00:00+00:00"
+            records.append({
+                "ticker":              ticker,
+                "settlement_date":     prior_settle.isoformat(),
+                "event_timestamp":     pts,
+                "knowledge_timestamp": fetch_kt,   # prior month also known at fetch time
+                "shares_short":        int(prior_shares),
+                "days_to_cover":       None,
+                "short_pct_float":     None,
+                "float_shares":        int(float_shares) if float_shares else None,
+                "source":              "yfinance_prior",
+            })
+
+    except Exception as exc:
+        log.debug("Short interest %s: %s", ticker, exc)
+
+    return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+async def fetch_all_short_interest(tickers: list[str]) -> pd.DataFrame:
+    log.info("📉  Fetching short interest for %d tickers (yfinance) …", len(tickers))
+    loop   = asyncio.get_running_loop()
+    frames = []
+    for i, ticker in enumerate(tickers, 1):
+        df = await loop.run_in_executor(None, fetch_short_interest_one, ticker)
+        if not df.empty:
+            frames.append(df)
+        await asyncio.sleep(0.25)
+        if i % 100 == 0:
+            log.info("    short_interest %d/%d …", i, len(tickers))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d short interest rows across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4d. Dividend history (derived — computed from OHLCV dividends + earnings EPS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_dividends_one(
@@ -575,9 +859,22 @@ def compute_dividends_one(
         eq = earn_sub[earn_sub["form"] == "10-Q"].copy() \
             if "form" in earn_sub.columns else earn_sub.copy()
         if not eq.empty:
-            eq["kt"] = pd.to_datetime(eq["knowledge_timestamp"], utc=True, errors="coerce")
-            eq["eps_year"] = eq["kt"].dt.year
             eq["epsactual"] = pd.to_numeric(eq["epsactual"], errors="coerce")
+            eq = eq.dropna(subset=["epsactual"])
+            # Use period_end (fiscal quarter end) rather than knowledge_timestamp
+            # to assign EPS to the correct fiscal year.  The implied Q4 filing
+            # (filed in Feb of the following year) has knowledge_timestamp.year =
+            # next_year, which would put it in the wrong payout-ratio bucket and
+            # make the denominator 3 quarters short → payout overstated by 33%.
+            eq["period_ts"] = pd.to_datetime(eq["period_end"], utc=True, errors="coerce")
+            eq = eq.dropna(subset=["period_ts"])
+            eq["eps_year"] = eq["period_ts"].dt.year
+            # Dedup: if the same period_end appears multiple times (restated),
+            # keep the most recently filed version before summing.
+            if "knowledge_timestamp" in eq.columns:
+                eq = eq.sort_values("knowledge_timestamp").drop_duplicates(
+                    subset=["period_end"], keep="last"
+                )
             ann_eps = eq.groupby("eps_year")["epsactual"].sum().reset_index()
             ann_eps.columns = ["year", "annual_eps"]
             df = df.merge(ann_eps, on="year", how="left")
@@ -637,11 +934,12 @@ async def fetch_fred_series(code: str, series_id: str) -> pd.DataFrame:
     """
     import os
     api_key = os.environ.get("FRED_API_KEY", "")
+    end_date = datetime.now(UTC).strftime("%Y-%m-%d")
     url = (
         f"https://api.stlouisfed.org/fred/series/observations"
         f"?series_id={series_id}"
         f"&observation_start={START_MACRO.strftime('%Y-%m-%d')}"
-        f"&observation_end={END.strftime('%Y-%m-%d')}"
+        f"&observation_end={end_date}"
         f"&api_key={api_key}&file_type=json"
     ) if api_key else (
         f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
@@ -693,11 +991,19 @@ async def fetch_fred_series(code: str, series_id: str) -> pd.DataFrame:
                         val = float(raw_val)
                     except ValueError:
                         continue
+                    # knowledge_timestamp = event_timestamp + publication lag.
+                    # Monthly macro data is NOT available on the reference date itself;
+                    # it is released days-to-weeks later.  Using the event date directly
+                    # would introduce look-ahead bias in PiT-correct backtests.
+                    pub_lag  = _FRED_PUB_LAG.get(code, 35)
+                    kt_date  = row[date_col].date() + pd.Timedelta(days=pub_lag)
+                    # Never exceed today
+                    kt_date  = min(kt_date, pd.Timestamp.today().date())
                     records.append({
                         "indicator_code":      code,
                         "series_id":           series_id,
                         "event_timestamp":     str(row[date_col].date()),
-                        "knowledge_timestamp": str(row[date_col].date()),
+                        "knowledge_timestamp": str(kt_date),
                         "value":               val,
                         "revision_number":     0,
                         "source":              "FRED_CSV",
@@ -718,6 +1024,21 @@ async def fetch_all_macro() -> pd.DataFrame:
         return pd.DataFrame()
     result = pd.concat(non_empty, ignore_index=True)
     if not result.empty:
+        # ── Derive CPI_YOY (true year-over-year %) from CPI_INDEX ────────────
+        cpi = result[result["indicator_code"] == "CPI_INDEX"].copy()
+        if not cpi.empty:
+            cpi["event_ts"] = pd.to_datetime(cpi["event_timestamp"], errors="coerce")
+            cpi = cpi.sort_values("event_ts").dropna(subset=["event_ts"])
+            cpi["value_12m_ago"] = cpi["value"].shift(12)
+            cpi_yoy = cpi.dropna(subset=["value_12m_ago"]).copy()
+            cpi_yoy["value"] = (
+                (cpi_yoy["value"] - cpi_yoy["value_12m_ago"]) / cpi_yoy["value_12m_ago"] * 100
+            ).round(4)
+            cpi_yoy["indicator_code"] = "CPI_YOY"
+            cpi_yoy["series_id"]      = "CPIAUCSL_YOY"
+            cpi_yoy = cpi_yoy.drop(columns=["event_ts", "value_12m_ago"])
+            result = pd.concat([result, cpi_yoy], ignore_index=True)
+
         for code, grp in result.groupby("indicator_code"):
             log.info("    %-20s  %d observations", code, len(grp))
     return result
@@ -836,27 +1157,63 @@ def fetch_earnings_edgar(ticker: str) -> pd.DataFrame:
         rows = []
         for unit_type, entries in eps_data.get("units", {}).items():
             for e in entries:
-                # Only quarterly filings (10-Q) and annual (10-K), not amendments
-                form = e.get("form", "")
-                if form not in ("10-Q", "10-K"):
+                # Accept 10-Q, 10-K and their amendments (10-Q/A, 10-K/A).
+                # Normalise amended forms to base form so restatements replace
+                # originals via PK dedup on (ticker, period_end, form).
+                raw_form = e.get("form", "")
+                base_form = raw_form.replace("/A", "")
+                if base_form not in ("10-Q", "10-K"):
                     continue
+                form = base_form  # store normalised form for consistent dedup
                 # "end" = period end date; "filed" = when SEC received the filing
                 period_end = e.get("end")
                 filed_date = e.get("filed")
                 val        = e.get("val")
                 if not period_end or val is None:
                     continue
+
+                # ── CRITICAL: filter by period duration ──────────────────────
+                # XBRL filings include BOTH quarterly (3-month) and YTD cumulative
+                # entries with the same period_end.  For Q3 specifically, there is
+                # a 3-month entry (Q3 EPS) and a 9-month entry (YTD EPS) — both
+                # with period_end = Q3 end date and form = "10-Q".  Without this
+                # filter, the dedup may keep the 9-month YTD value, causing the
+                # TTM P/E rolling sum to triple-count Q1/Q2 earnings.
+                # If start_date is absent for a 10-Q, we cannot verify it is
+                # quarterly so we skip it (absence typically indicates cumulative).
+                start_date = e.get("start")
+                if form == "10-Q" and not start_date:
+                    continue   # cannot verify duration — skip to be safe
+                if start_date:
+                    try:
+                        duration = (pd.Timestamp(period_end) - pd.Timestamp(start_date)).days
+                        if form == "10-Q" and not (60 <= duration <= 105):
+                            continue   # skip YTD cumulative entries in quarterly filings
+                        if form == "10-K" and not (330 <= duration <= 400):
+                            continue   # skip transition-period / partial-year filings
+                    except Exception:
+                        pass   # unparseable dates — let the row through
+
+                try:
+                    epsactual = float(val)
+                except (ValueError, TypeError):
+                    continue   # skip non-numeric XBRL values (rare but possible)
                 rows.append({
                     "ticker":              ticker,
                     "period_end":          period_end,
-                    "epsactual":           float(val),
+                    "epsactual":           epsactual,
                     "epsestimate":         None,   # EDGAR has no consensus estimates
                     "epsdifference":       None,
                     "surprisepercent":     None,
                     "form":                form,
                     "event_timestamp":     period_end,
                     # PiT: the value was only known after the SEC filing date
-                    "knowledge_timestamp": filed_date or period_end,
+                    # PiT: use filing date when available. If the XBRL entry lacks
+                    # a "filed" field (rare), fall back to period_end + 45 days so
+                    # we don't accidentally front-run the earnings announcement.
+                    "knowledge_timestamp": filed_date or (
+                        pd.Timestamp(period_end) + pd.Timedelta(days=45)
+                    ).date().isoformat(),
                     "source":              "SEC_EDGAR",
                 })
         if not rows:
@@ -901,9 +1258,24 @@ def fetch_earnings_one(ticker: str) -> pd.DataFrame:
                     break
             if "period_end" in hist.columns:
                 hist["period_end"] = hist["period_end"].astype(str).str[:10]
-                hist["event_timestamp"]     = hist["period_end"]
-                hist["knowledge_timestamp"] = hist["period_end"]
+                hist["event_timestamp"] = hist["period_end"]
+                # PiT: knowledge_timestamp = period_end + 45 days (conservative
+                # estimate for when quarterly earnings are publicly announced).
+                # Companies typically report 3-6 weeks after quarter end; 45 days
+                # is safely conservative.  Using period_end directly would be
+                # look-ahead bias of ~3-4 weeks for non-EDGAR tickers.
+                _today = datetime.now(UTC).date().isoformat()
+                hist["knowledge_timestamp"] = hist["period_end"].apply(
+                    lambda d: min(
+                        (pd.Timestamp(d) + pd.Timedelta(days=45)).date().isoformat(),
+                        _today,
+                    )
+                )
                 hist["source"] = "yfinance"
+                # Set form="10-Q" so the earnings PK (ticker, period_end, form)
+                # deduplicates correctly if EDGAR data is later added for the same ticker.
+                if "form" not in hist.columns:
+                    hist["form"] = "10-Q"
                 yf_df = hist
     except Exception as exc:
         log.debug("yfinance earnings %s: %s", ticker, exc)
@@ -941,6 +1313,254 @@ async def fetch_all_earnings(tickers: list[str]) -> pd.DataFrame:
     log.info("    → %d earnings records across %d tickers",
              len(result), result["ticker"].nunique() if not result.empty else 0)
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6a-extra. Implied Q4 EPS (derived: annual EPS − Q1 − Q2 − Q3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_implied_q4_eps_one(ticker: str, earn_sub: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each fiscal year with a 10-K, derive implied Q4 EPS:
+        implied_Q4 = annual_EPS(10-K) − Q1_EPS − Q2_EPS − Q3_EPS
+
+    Companies don't file a separate 10-Q for fiscal Q4, so this implied value
+    fills the gap in the TTM P/E rolling-4-quarter calculation.
+
+    The synthetic row is stored with:
+        form               = '10-Q'        (picked up by TTM calculation)
+        period_end         = 10-K period_end
+        knowledge_timestamp = 10-K knowledge_timestamp  (PiT-correct)
+        source             = 'implied_q4'
+    """
+    if earn_sub is None or earn_sub.empty:
+        return pd.DataFrame()
+
+    eps_col = next((c for c in earn_sub.columns if "epsactual" in c.lower()), None)
+    if eps_col is None:
+        return pd.DataFrame()
+
+    earn_sub = earn_sub.copy()
+    earn_sub["_period_ts"] = pd.to_datetime(earn_sub["period_end"], errors="coerce", utc=True)
+
+    # Non-EDGAR tickers (ASML, ARM, etc.) may have no "form" column (yfinance-only).
+    # For implied Q4 we need both annual (10-K) and quarterly (10-Q) rows.
+    # If form is absent, we cannot distinguish annual from quarterly, so skip.
+    if "form" not in earn_sub.columns:
+        return pd.DataFrame()
+    annual    = earn_sub[earn_sub["form"] == "10-K"].dropna(subset=["_period_ts", eps_col])
+    quarterly = earn_sub[earn_sub["form"] == "10-Q"].dropna(subset=["_period_ts", eps_col])
+
+    if annual.empty or quarterly.empty:
+        return pd.DataFrame()
+
+    implied_rows = []
+    for _, ann in annual.iterrows():
+        fiscal_end = ann["_period_ts"]
+        annual_eps = pd.to_numeric(ann[eps_col], errors="coerce")
+        if pd.isna(annual_eps):
+            continue
+
+        # Find Q1+Q2+Q3 in the 9 months before fiscal year end
+        window = quarterly[
+            (quarterly["_period_ts"] > fiscal_end - pd.Timedelta(days=280)) &
+            (quarterly["_period_ts"] < fiscal_end)
+        ]
+        if len(window) < 3:
+            continue   # not enough quarters — skip to avoid spurious estimates
+
+        # Use the 3 quarters closest to fiscal year end
+        window = window.nlargest(3, "_period_ts")
+        q_eps = pd.to_numeric(window[eps_col], errors="coerce").dropna()
+        if len(q_eps) < 3:
+            continue
+        q1q2q3 = q_eps.sum()
+
+        implied_q4 = float(annual_eps) - float(q1q2q3)
+
+        # Sanity: implied Q4 magnitude should be roughly in line with the average
+        # per-quarter magnitude of Q1+Q2+Q3.  Use per-quarter absolute average so
+        # loss companies (where q1q2q3 < 0) are not incorrectly rejected — computing
+        # avg_q = abs(sum)/3 understates the per-quarter magnitude when quarters have
+        # mixed signs, while sum of abs / 3 is the true average quarter magnitude.
+        avg_q_abs = sum(abs(float(x)) for x in q_eps) / len(q_eps)
+        if avg_q_abs > 0 and abs(implied_q4) > avg_q_abs * 6:
+            continue   # implausible magnitude — skip (e.g. massive write-down quarter)
+
+        implied_rows.append({
+            "ticker":               ticker,
+            "period_end":           ann["period_end"],
+            "epsactual":            round(implied_q4, 4),
+            "epsestimate":          None,
+            "epsdifference":        None,
+            "surprisepercent":      None,
+            "form":                 "10-Q",
+            "event_timestamp":      ann["period_end"],
+            "knowledge_timestamp":  ann["knowledge_timestamp"],
+            "source":               "implied_q4",
+        })
+
+    if not implied_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(implied_rows)
+
+
+def compute_all_implied_q4_eps(tickers: list[str], earn_all: pd.DataFrame) -> pd.DataFrame:
+    """Compute implied Q4 EPS rows for all tickers. earn_all is pre-loaded."""
+    log.info("📐  Computing implied Q4 EPS for %d tickers …", len(tickers))
+    frames = []
+    for ticker in tickers:
+        df = compute_implied_q4_eps_one(
+            ticker,
+            earn_all[earn_all["ticker"] == ticker] if not earn_all.empty else pd.DataFrame(),
+        )
+        if not df.empty:
+            frames.append(df)
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d implied Q4 rows across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6a-extra-2. yfinance financial fallback (for non-EDGAR/foreign filers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tickers that don't file 10-K/10-Q with SEC EDGAR (foreign filers, recent IPOs)
+NON_EDGAR_TICKERS = {"ASML", "ARM", "PDD", "CCEP", "FER"}
+
+_YF_INC_MAP: dict[str, list[str]] = {
+    "revenue":                   ["Total Revenue", "Revenue"],
+    "gross_profit":              ["Gross Profit"],
+    "operating_income":          ["Operating Income", "EBIT"],
+    "net_income":                ["Net Income", "Net Income Common Stockholders"],
+    "interest_expense":          ["Interest Expense", "Interest Expense Non Operating"],
+    "depreciation_amortization": ["Reconciled Depreciation",
+                                  "Depreciation And Amortization"],
+}
+_YF_BS_MAP: dict[str, list[str]] = {
+    "total_assets":        ["Total Assets"],
+    "total_equity":        ["Stockholders Equity",
+                            "Total Equity Gross Minority Interest"],
+    "lt_debt":             ["Long Term Debt",
+                            "Long Term Debt And Capital Lease Obligation"],
+    "cash":                ["Cash And Cash Equivalents",
+                            "Cash Cash Equivalents And Short Term Investments"],
+    "shares_outstanding":  ["Ordinary Shares Number", "Share Issued"],
+}
+_YF_CF_MAP: dict[str, list[str]] = {
+    "operating_cf": ["Operating Cash Flow"],
+    "capex":        ["Capital Expenditure", "Purchase Of Ppe"],
+}
+
+
+def fetch_financials_yfinance(ticker: str) -> pd.DataFrame:
+    """
+    Fetch annual fundamental data from yfinance.
+
+    Used as:
+      1. Primary source for non-EDGAR filers (ASML, ARM, PDD, CCEP, FER).
+      2. Fallback for EDGAR-covered tickers with sparse balance sheet data.
+
+    PiT knowledge_timestamp: 90 days after fiscal year end (conservative
+    estimate for foreign 20-F filers; real lag is 90-120 days).
+    """
+    try:
+        t = yf.Ticker(ticker)
+        inc = t.financials       # rows=metrics, cols=fiscal year-end dates
+        bs  = t.balance_sheet
+        cf  = t.cashflow
+
+        def _pick(df_src, names: list[str], date_col) -> float | None:
+            if df_src is None or df_src.empty:
+                return None
+            for name in names:
+                if name in df_src.index and date_col in df_src.columns:
+                    val = df_src.at[name, date_col]
+                    try:
+                        f = float(val)
+                        return f if not pd.isna(f) else None
+                    except Exception:
+                        pass
+            return None
+
+        # Union of all date columns across all three statements
+        all_dates: set = set()
+        for src in (inc, bs, cf):
+            if src is not None and not src.empty:
+                all_dates.update(src.columns.tolist())
+
+        if not all_dates:
+            return pd.DataFrame()
+
+        rows = []
+        now_utc = datetime.now(UTC)
+        for date_col in sorted(all_dates):
+            try:
+                period_ts = pd.Timestamp(date_col)
+            except Exception:
+                continue
+            if period_ts < pd.Timestamp("2010-01-01"):
+                continue
+
+            # PiT: 90 days after fiscal year end, capped at today
+            filing_ts = min(period_ts + pd.Timedelta(days=90),
+                            pd.Timestamp(now_utc.date()))
+            period_str  = period_ts.date().isoformat()
+            filing_str  = filing_ts.isoformat()
+
+            row: dict = {
+                "ticker":               ticker,
+                "period_end":           period_str,
+                "form":                 "10-K",   # annual equivalent
+                "event_timestamp":      period_str,
+                "knowledge_timestamp":  filing_str,
+                "source":               "yfinance",
+            }
+
+            for our_col, names in _YF_INC_MAP.items():
+                row[our_col] = _pick(inc, names, date_col)
+            for our_col, names in _YF_BS_MAP.items():
+                row[our_col] = _pick(bs,  names, date_col)
+            for our_col, names in _YF_CF_MAP.items():
+                row[our_col] = _pick(cf,  names, date_col)
+
+            # Derived metrics
+            def _sdiv(a, b):
+                try:
+                    return float(a) / float(b) if b and float(b) != 0 else None
+                except Exception:
+                    return None
+
+            op_cf  = row.get("operating_cf")
+            capex  = row.get("capex")
+            if op_cf is not None and capex is not None:
+                # yfinance reports capex as negative outflow — subtract magnitude
+                row["fcf"] = float(op_cf) - abs(float(capex))
+
+            row["gross_margin"]   = _sdiv(row.get("gross_profit"),  row.get("revenue"))
+            row["net_margin"]     = _sdiv(row.get("net_income"),     row.get("revenue"))
+            row["roe"]            = _sdiv(row.get("net_income"),     row.get("total_equity"))
+            row["debt_to_equity"] = _sdiv(row.get("lt_debt"),        row.get("total_equity"))
+            row["fcf_margin"]     = _sdiv(row.get("fcf"),            row.get("revenue"))
+
+            # Require at least revenue or net_income to keep the row
+            if row.get("revenue") is None and row.get("net_income") is None:
+                continue
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        # Dedup: keep latest per (ticker, period_end, form)
+        df = df.sort_values("knowledge_timestamp").drop_duplicates(
+            subset=["ticker", "period_end", "form"], keep="last"
+        )
+        return df.reset_index(drop=True)
+
+    except Exception as exc:
+        log.debug("fetch_financials_yfinance %s: %s", ticker, exc)
+        return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1104,6 +1724,8 @@ _GAAP_TAGS: dict[str, list[str]] = {
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "SalesRevenue",                # pre-ASC 606 filers, some banks
+        "RevenuesNet",                 # some retail/service companies
     ],
     "gross_profit":      ["GrossProfit"],
     "operating_income":  ["OperatingIncomeLoss"],
@@ -1137,8 +1759,91 @@ _GAAP_TAGS: dict[str, list[str]] = {
 }
 
 
+def _ttm_flow_series(fin_sub: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """
+    Compute a PiT TTM (trailing-twelve-month) series for a flow metric
+    (revenue or fcf) using quarterly incremental 10-Q values plus an implied
+    Q4 = annual_10K_value − Q1 − Q2 − Q3.
+
+    This mirrors the implied-Q4-EPS approach: companies do not file a 10-Q
+    for fiscal Q4, so a naive rolling(4) over 10-Q rows skips Q4 entirely and
+    substitutes Q3 of the prior fiscal year — systematically understating TTM
+    for growing companies and misstating it for seasonal ones.
+
+    Returns DataFrame[kt, ttm_{metric}] sorted by kt, ready for merge_asof.
+    """
+    col = f"ttm_{metric}"
+    empty = pd.DataFrame(columns=["kt", col])
+    if fin_sub.empty or "form" not in fin_sub.columns or metric not in fin_sub.columns:
+        return empty
+
+    fin = fin_sub.copy()
+    fin["_pe"] = pd.to_datetime(fin["period_end"], utc=True, errors="coerce")
+    fin["_kt"] = pd.to_datetime(fin["knowledge_timestamp"], utc=True, errors="coerce")
+    fin["_val"] = pd.to_numeric(fin[metric], errors="coerce")
+    fin = fin.dropna(subset=["_pe", "_kt", "_val"])
+    if fin.empty:
+        return empty
+
+    annual  = fin[fin["form"] == "10-K"].copy()
+    quarterly = fin[fin["form"] == "10-Q"].copy()
+
+    # ── Build a complete quarterly timeline including implied Q4 ──────────────
+    # Each record: (fiscal period_end, knowledge_timestamp, quarterly_value)
+    records: list[tuple] = [(r["_pe"], r["_kt"], r["_val"]) for _, r in quarterly.iterrows()]
+
+    for _, ann in annual.iterrows():
+        ann_pe  = ann["_pe"]
+        ann_kt  = ann["_kt"]
+        ann_val = ann["_val"]
+
+        # Q1/Q2/Q3 whose period_end falls within the annual's fiscal year.
+        # 370-day window handles all standard fiscal year lengths.
+        fy_start = ann_pe - pd.Timedelta(days=370)
+        q_in_fy  = quarterly[
+            (quarterly["_pe"] > fy_start) & (quarterly["_pe"] <= ann_pe)
+        ]
+
+        if len(q_in_fy) != 3:
+            # Require exactly 3 quarters so implied Q4 is unambiguous.
+            # (< 3 means some quarters are missing; > 3 is a data anomaly.)
+            continue
+
+        q4_implied = ann_val - q_in_fy["_val"].sum()
+        # Q4 period_end ≡ the annual period_end.
+        # kt = max(10-K filing date, latest Q1/Q2/Q3 filing date):
+        # The TTM value depends on all three quarterly values; if the 10-K
+        # is filed before the Q3 10-Q (rare but occurs with amendments),
+        # serving the implied-Q4 TTM before Q3 is public is look-ahead bias.
+        latest_component_kt = max(ann_kt, q_in_fy["_kt"].max())
+        records.append((ann_pe, latest_component_kt, q4_implied))
+
+    if not records:
+        return empty
+
+    df = pd.DataFrame(records, columns=["_pe", "_kt", "_val"])
+    # Sort by period_end, keep the latest filing when duplicates exist (amendments)
+    df = (df.sort_values(["_pe", "_kt"])
+            .drop_duplicates("_pe", keep="last")
+            .reset_index(drop=True))
+
+    # Rolling 4-quarter sum in fiscal period order → true TTM
+    df[col] = df["_val"].rolling(4, min_periods=4).sum()
+    df = df.dropna(subset=[col])
+
+    # Return kt-sorted table for merge_asof(direction="backward").
+    # drop_duplicates on kt: if two different fiscal period_ends share the same
+    # filing date (rare but possible for same-day filings), keep the one from
+    # the later fiscal period (already last after sort_values(["_pe","_kt"])).
+    return (df[["_kt", col]]
+              .rename(columns={"_kt": "kt"})
+              .sort_values("kt")
+              .drop_duplicates("kt", keep="last")
+              .reset_index(drop=True))
+
+
 def _extract_xbrl_metric(
-    us_gaap: dict, tags: list[str]
+    us_gaap: dict, tags: list[str], duration_check: bool = True
 ) -> dict[tuple, tuple]:
     """
     Merge data from ALL candidate tags into {(period_end, form): (value, filed_date)}.
@@ -1149,6 +1854,10 @@ def _extract_xbrl_metric(
     Conflict resolution when multiple tags report the same (period_end, form):
       - Earlier tag in the priority list wins (it is preferred semantically).
       - Within the same tag, the most recently filed revision wins.
+
+    duration_check: if True (default), filters out YTD cumulative entries in
+      10-Q filings by checking the period duration.  Set False for instant
+      (balance-sheet) tags that have no start date.
     """
     merged: dict[tuple, tuple] = {}
     for priority, tag in enumerate(tags):
@@ -1157,14 +1866,39 @@ def _extract_xbrl_metric(
             continue
         for unit_vals in data.get("units", {}).values():
             for e in unit_vals:
-                form = e.get("form", "")
-                if form not in ("10-K", "10-Q"):
+                # Accept 10-Q/A and 10-K/A; normalise to base form so amended
+                # filings replace originals via PK dedup on (period_end, form).
+                raw_form = e.get("form", "")
+                base_form = raw_form.replace("/A", "")
+                if base_form not in ("10-K", "10-Q"):
                     continue
+                form = base_form
                 period_end = e.get("end")
                 filed      = e.get("filed", "")
                 val        = e.get("val")
                 if not period_end or val is None:
                     continue
+
+                # Filter by period duration to avoid picking up YTD cumulative entries.
+                # 10-Q filings include both quarterly (3-month) and YTD cumulative entries
+                # for the same period_end.  Income-statement/CF metrics should be per-quarter
+                # so that annual aggregations don't double-count earlier quarters.
+                # If start_date is absent for a 10-Q with duration_check, skip it —
+                # absence typically means the entry is cumulative with no range declared.
+                if duration_check:
+                    start_date = e.get("start")
+                    if form == "10-Q" and not start_date:
+                        continue   # cannot verify duration — skip to be safe
+                    if start_date:
+                        try:
+                            dur = (pd.Timestamp(period_end) - pd.Timestamp(start_date)).days
+                            if form == "10-Q" and not (60 <= dur <= 105):
+                                continue   # YTD cumulative — skip
+                            if form == "10-K" and not (330 <= dur <= 400):
+                                continue   # transition-period filing — skip
+                        except Exception:
+                            pass   # unparseable dates — let through
+
                 key = (period_end, form)
                 existing = merged.get(key)
                 if existing is None:
@@ -1202,9 +1936,16 @@ def fetch_financials_edgar(ticker: str) -> pd.DataFrame:
             return pd.DataFrame()
         us_gaap = resp.json().get("facts", {}).get("us-gaap", {})
 
+        # Balance-sheet tags are "instant" values (no start date) — duration check N/A.
+        # Income statement and cash-flow tags are "duration" and need the filter to
+        # avoid picking up YTD cumulative entries (e.g., 9-month Q3 revenue).
+        _INSTANT_TAGS = {"total_assets", "total_equity", "lt_debt", "cash",
+                         "shares_outstanding"}
+
         # Extract all metrics into {(period_end, form): (value, filed)} dicts
         metric_data: dict[str, dict[tuple, tuple]] = {
-            metric: _extract_xbrl_metric(us_gaap, tags)
+            metric: _extract_xbrl_metric(us_gaap, tags,
+                                         duration_check=(metric not in _INSTANT_TAGS))
             for metric, tags in _GAAP_TAGS.items()
         }
 
@@ -1251,8 +1992,11 @@ def fetch_financials_edgar(ticker: str) -> pd.DataFrame:
             except Exception:
                 return None
 
+        # capex from PaymentsToAcquirePropertyPlantAndEquipment should be positive
+        # per US GAAP taxonomy, but some filers report it as a negative outflow.
+        # Using abs() matches the yfinance path and is correct under both conventions.
         df["fcf"]           = df.apply(
-            lambda r: (float(r["operating_cf"]) - float(r["capex"]))
+            lambda r: (float(r["operating_cf"]) - abs(float(r["capex"])))
             if r["operating_cf"] is not None and r["capex"] is not None else None, axis=1)
         df["gross_margin"]  = df.apply(lambda r: _div(r["gross_profit"],  r["revenue"]),       axis=1)
         df["net_margin"]    = df.apply(lambda r: _div(r["net_income"],     r["revenue"]),       axis=1)
@@ -1369,7 +2113,306 @@ def run_pit_check(ohlcv: pd.DataFrame) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Build a sample PiT snapshot (like the backtester would)
+# 8. Sector / industry classification  (yfinance, static reference table)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_sectors(tickers: list[str]) -> pd.DataFrame:
+    """
+    Fetch sector, industry, GICS sub-industry, and market-cap category for
+    every ticker via yfinance.  Returns one row per ticker.
+
+    Schema:
+        ticker, sector, industry, gics_sub_industry,
+        market_cap_category, country, exchange,
+        knowledge_timestamp, source
+    """
+    now_ts = datetime.now(UTC).isoformat()
+    rows = []
+    for i, ticker in enumerate(tickers, 1):
+        try:
+            info = yf.Ticker(ticker).info
+            mc = info.get("marketCap") or 0
+            if   mc > 200e9: cap_cat = "mega"
+            elif mc >  10e9: cap_cat = "large"
+            elif mc >   2e9: cap_cat = "mid"
+            else:            cap_cat = "small"
+
+            rows.append({
+                "ticker":              ticker,
+                "sector":              info.get("sector")              or "",
+                "industry":            info.get("industry")            or "",
+                "gics_sub_industry":   info.get("industryKey")         or "",
+                "market_cap_category": cap_cat,
+                "country":             info.get("country")             or "",
+                "exchange":            info.get("exchange")            or "",
+                "knowledge_timestamp": now_ts,
+                "source":              "yfinance",
+            })
+            time.sleep(0.15)
+        except Exception as exc:
+            log.debug("fetch_sectors %s: %s", ticker, exc)
+        if i % 100 == 0:
+            log.info("  sectors %d/%d …", i, len(tickers))
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Quality metrics  (computed from existing financials + ohlcv)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_quality_metrics_one(
+    ticker: str,
+    fin_sub: pd.DataFrame,   # all financials rows for this ticker
+    ohlcv_sub: pd.DataFrame, # OHLCV rows for this ticker (for market-cap lookup)
+) -> pd.DataFrame:
+    """
+    Compute fundamental quality metrics for one ticker, one row per annual
+    10-K filing.  All metrics are PiT-correct: only data available at
+    knowledge_timestamp is used.
+
+    Metrics:
+        roic              — Return on Invested Capital  (NOPAT / invested_capital)
+        fcf_yield_filing  — FCF / market_cap at filing date
+        net_debt_ebitda   — (lt_debt - cash) / (operating_income + D&A)
+        revenue_cagr_1y   — Annualised revenue growth vs. prior 10-K
+        revenue_cagr_3y   — Annualised revenue growth vs. 3 prior 10-Ks
+        revenue_cagr_5y   — Annualised revenue growth vs. 5 prior 10-Ks
+        eps_cagr_1y       — Annualised EPS growth vs. prior 10-K
+        eps_cagr_3y       — Annualised EPS growth vs. 3 prior 10-Ks
+        gross_margin_curr — gross_margin at this filing
+        gross_margin_3y_avg — avg gross_margin over prior 3 10-Ks
+        gross_margin_trend  — curr - 3y_avg  (positive = improving)
+        buyback_yield     — (shares_t-1 - shares_t) / shares_t-1  (positive=buyback)
+        earnings_consistency_5y — fraction of last 5 years with net_income growth
+    """
+    if fin_sub is None or fin_sub.empty:
+        return pd.DataFrame()
+
+    # ── 1. Annual filings only, sorted by period_end ──────────────────────────
+    ann = fin_sub[fin_sub["form"] == "10-K"].copy()
+    if ann.empty:
+        return pd.DataFrame()
+
+    ann["period_ts"] = pd.to_datetime(ann["period_end"], errors="coerce", utc=True)
+    ann["kt"]        = pd.to_datetime(ann["knowledge_timestamp"], errors="coerce", utc=True)
+    ann = ann.dropna(subset=["period_ts"]).sort_values("period_ts").reset_index(drop=True)
+
+    # ── 2. OHLCV price lookup table (for market cap at filing date) ───────────
+    price_lkp = pd.DataFrame()
+    if ohlcv_sub is not None and not ohlcv_sub.empty:
+        p = ohlcv_sub.copy()
+        p["pts"] = pd.to_datetime(p["event_timestamp"], utc=True)
+        price_lkp = p[["pts", "close"]].sort_values("pts")
+
+    def _close_at(kt: pd.Timestamp) -> float | None:
+        """Most recent close on or before the filing date."""
+        if price_lkp.empty or pd.isna(kt):
+            return None
+        before = price_lkp[price_lkp["pts"] <= kt]
+        return float(before["close"].iloc[-1]) if not before.empty else None
+
+    def _safe_div(a, b) -> float | None:
+        try:
+            a, b = float(a), float(b)
+            return a / b if b != 0 else None
+        except Exception:
+            return None
+
+    def _cagr(v_now, v_past, years: int) -> float | None:
+        try:
+            v_now, v_past = float(v_now), float(v_past)
+            if v_past <= 0 or v_now <= 0 or years <= 0:
+                return None
+            return (v_now / v_past) ** (1.0 / years) - 1.0
+        except Exception:
+            return None
+
+    # ── 3. Build one output row per 10-K ─────────────────────────────────────
+    rows = []
+    for i, row in ann.iterrows():
+        def _get(col):
+            v = row.get(col)
+            try: return float(v) if v is not None and str(v) != "nan" else None
+            except Exception: return None
+
+        op_inc  = _get("operating_income")
+        da      = _get("depreciation_amortization")
+        eq      = _get("total_equity")
+        lt_debt = _get("lt_debt")  or 0.0
+        cash    = _get("cash")     or 0.0
+        fcf     = _get("fcf")
+        shares  = _get("shares_outstanding")
+        rev     = _get("revenue")
+        net_inc = _get("net_income")
+        gm      = _get("gross_margin")
+
+        # ROIC — NOPAT ≈ operating_income × (1 - tax_rate).
+        # US statutory rate was 35% through 2017, 21% from 2018 (TCJA).
+        # Using a year-based rate avoids ~22% relative overstatement in pre-2018 ROIC.
+        _period_year = pd.Timestamp(row["period_end"]).year if row.get("period_end") else 2018
+        _tax_rate    = 0.35 if _period_year <= 2017 else 0.21
+        nopat    = op_inc * (1.0 - _tax_rate) if op_inc is not None else None
+        inv_cap  = (eq or 0.0) + lt_debt - cash
+        roic     = _safe_div(nopat, inv_cap) if inv_cap and abs(inv_cap) > 1e6 else None
+        # Cap ROIC: values outside [-100%, 300%] indicate near-zero invested capital
+        if roic is not None and (roic < -1.0 or roic > 3.0):
+            roic = None
+
+        # FCF yield at filing date
+        close_at_filing = _close_at(row["kt"])
+        mktcap = (close_at_filing * shares) if (close_at_filing and shares) else None
+        fcf_yield = _safe_div(fcf, mktcap)
+        if fcf_yield is not None and abs(fcf_yield) > 1.0:
+            fcf_yield = None   # implausible
+
+        # Net debt / EBITDA
+        ebitda     = (op_inc or 0.0) + (da or 0.0)
+        net_debt   = lt_debt - cash
+        nd_ebitda  = _safe_div(net_debt, ebitda) if ebitda and abs(ebitda) > 1e6 else None
+        if nd_ebitda is not None and abs(nd_ebitda) > 50:
+            nd_ebitda = None   # implausible
+
+        # Revenue CAGRs — look back in sorted annual history
+        def _prior_rev(n_years: int):
+            j = i - n_years
+            if j < 0 or j not in ann.index:
+                # find by position
+                pos = ann.index.get_loc(i)
+                if pos < n_years:
+                    return None
+                return ann.iloc[pos - n_years].get("revenue")
+            return ann.loc[j].get("revenue")
+
+        def _cap_cagr(v):
+            # Cap CAGR at [-80%, 500%] — beyond this range it's a spin-off, restatement,
+            # or hypergrowth from near-zero base (not a meaningful compound rate)
+            if v is None: return None
+            return v if -0.8 <= v <= 5.0 else None
+
+        rev_1y = _cap_cagr(_cagr(rev, _prior_rev(1), 1)) if rev else None
+        rev_3y = _cap_cagr(_cagr(rev, _prior_rev(3), 3)) if rev else None
+        rev_5y = _cap_cagr(_cagr(rev, _prior_rev(5), 5)) if rev else None
+
+        # EPS CAGRs
+        eps_now = _safe_div(net_inc, shares)
+        def _prior_eps(n_years: int):
+            pos = ann.index.get_loc(i)
+            if pos < n_years:
+                return None
+            r = ann.iloc[pos - n_years]
+            ni, sh = r.get("net_income"), r.get("shares_outstanding")
+            return _safe_div(ni, sh)
+
+        eps_1y = _cap_cagr(_cagr(eps_now, _prior_eps(1), 1)) if eps_now else None
+        eps_3y = _cap_cagr(_cagr(eps_now, _prior_eps(3), 3)) if eps_now else None
+
+        # Gross margin trend
+        pos = ann.index.get_loc(i)
+        def _safe_float(v) -> float | None:
+            """Convert to float, returning None for None/'None'/'nan'/NaN."""
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return f if not pd.isna(f) else None
+            except (ValueError, TypeError):
+                return None
+        prior_gms = [
+            _safe_float(ann.iloc[pos - k].get("gross_margin"))
+            for k in range(1, 4)
+            if pos >= k
+        ]
+        prior_gms = [v for v in prior_gms if v is not None]
+        gm_3y_avg = sum(prior_gms) / len(prior_gms) if prior_gms else None
+        gm_trend  = (gm - gm_3y_avg) if (gm is not None and gm_3y_avg is not None) else None
+
+        # Buyback yield — share count change vs. prior year
+        buyback_yield = None
+        if pos >= 1:
+            prior_shares = ann.iloc[pos - 1].get("shares_outstanding")
+            if prior_shares and shares:
+                try:
+                    buyback_yield = (float(prior_shares) - float(shares)) / float(prior_shares)
+                    if abs(buyback_yield) > 0.5:   # implausible (> 50% change)
+                        buyback_yield = None
+                except Exception:
+                    pass
+
+        # Earnings consistency (last 5 years with positive YoY net income growth)
+        earn_consistency = None
+        if pos >= 1:
+            lookback = min(5, pos)
+            growths = []
+            for k in range(1, lookback + 1):
+                ni_now  = ann.iloc[pos - k + 1].get("net_income")
+                ni_prev = ann.iloc[pos - k    ].get("net_income")
+                if ni_now is not None and ni_prev is not None:
+                    try:
+                        growths.append(float(ni_now) > float(ni_prev))
+                    except Exception:
+                        pass
+            if growths:
+                earn_consistency = sum(growths) / len(growths)
+
+        rows.append({
+            "ticker":                  ticker,
+            "period_end":              row.get("period_end"),
+            "form":                    "10-K",
+            "event_timestamp":         row.get("period_end"),
+            "knowledge_timestamp":     row.get("knowledge_timestamp"),
+            "source":                  "computed",
+            "roic":                    roic,
+            "fcf_yield_filing":        fcf_yield,
+            "net_debt_ebitda":         nd_ebitda,
+            "revenue_cagr_1y":         rev_1y,
+            "revenue_cagr_3y":         rev_3y,
+            "revenue_cagr_5y":         rev_5y,
+            "eps_cagr_1y":             eps_1y,
+            "eps_cagr_3y":             eps_3y,
+            "gross_margin_curr":       gm,
+            "gross_margin_3y_avg":     gm_3y_avg,
+            "gross_margin_trend":      gm_trend,
+            "buyback_yield":           buyback_yield,
+            "earnings_consistency_5y": earn_consistency,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def compute_all_quality_metrics(
+    tickers: list[str],
+    fin_all: pd.DataFrame,
+    ohlcv_all: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute quality metrics for all tickers. Tables are pre-loaded."""
+    log.info("📊  Computing quality metrics for %d tickers …", len(tickers))
+    frames = []
+    for i, ticker in enumerate(tickers, 1):
+        try:
+            df = compute_quality_metrics_one(
+                ticker,
+                fin_all[fin_all["ticker"] == ticker] if not fin_all.empty else pd.DataFrame(),
+                ohlcv_all[ohlcv_all["ticker"] == ticker] if not ohlcv_all.empty else pd.DataFrame(),
+            )
+            if not df.empty:
+                frames.append(df)
+        except Exception as exc:
+            log.debug("quality_metrics %s: %s", ticker, exc)
+        if i % 100 == 0:
+            log.info("    quality_metrics %d/%d …", i, len(tickers))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    log.info("    → %d quality metric rows across %d tickers",
+             len(result), result["ticker"].nunique() if not result.empty else 0)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Build a sample PiT snapshot (like the backtester would)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_sample_snapshot(
@@ -1437,7 +2480,7 @@ def build_sample_snapshot(
     # ── Returns (last 52 weeks) ───────────────────────────────────────────────
     returns_52w = {}
     if not price_wide.empty and len(price_wide) > 10:
-        pct = price_wide.pct_change(fill_method=None).dropna(how="all")
+        pct = price_wide.pct_change().dropna(how="all")
         cum_ret = (1 + pct).prod() - 1
         for ticker in cum_ret.index:
             if pd.notna(cum_ret[ticker]):
@@ -1489,7 +2532,7 @@ async def main() -> None:
     log.info("=" * 65)
     log.info("  FINANCIAL DATA PIPELINE — STANDALONE CRAWLER RUN")
     log.info("  Equity start: %s  |  Macro start: %s  |  End: %s",
-             START_EQUITY.date(), START_MACRO.date(), END.date())
+             START_EQUITY.date(), START_MACRO.date(), datetime.now(UTC).date())
     log.info("=" * 65)
 
     # 1. Universe (live from Wikipedia: S&P 500 + NASDAQ 100)
